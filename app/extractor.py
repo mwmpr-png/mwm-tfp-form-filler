@@ -103,6 +103,177 @@ def all_text_and_fields(paths: list[Path]) -> tuple[str, dict[str, str]]:
     return clean("\n\n".join(texts)), merged_fields
 
 
+
+
+def normalise_nric_from_text(text: str) -> str:
+    """Extract Singapore NRIC/FIN-like value from noisy OCR text."""
+    raw = clean(text).upper().replace("§", "S").replace("＄", "S")
+    # Remove separators but preserve contiguous alphanumeric sequences.
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    m = re.search(r"([STFG]\d{7}[A-Z])", compact)
+    return m.group(1) if m else ""
+
+
+def normalise_nationality(raw: str, nric: str = "") -> str:
+    val = clean(raw).upper()
+    if not val:
+        return ""
+    if "SINGAPORE CITIZEN" in val or val == "SINGAPOREAN":
+        return "SINGAPORE CITIZEN"
+    if "SINGAPORE PR" in val or "PERMANENT RESIDENT" in val:
+        return "SINGAPORE PR"
+    # Singapore NRIC with non-Singapore nationality normally indicates PR status for the TFP field.
+    if nric and nric[0] in "ST" and val not in ("SINGAPORE", "SINGAPORE CITIZEN"):
+        return "SINGAPORE PR"
+    return val.title() if val.isupper() else raw
+
+
+def parse_id_text(text: str) -> dict[str, str]:
+    text = clean(text)
+    out: dict[str, str] = {}
+    nric = normalise_nric_from_text(text)
+    if nric:
+        out["nric"] = nric
+    name = find(r"(?:^|\n)\s*(?:NAME|Name)\s*\n\s*([A-Z][A-Z\s,.'\-()/]+?)(?:\n|NRIC|DATE OF BIRTH|NATIONALITY)", text, flags=re.I | re.S)
+    if name:
+        name = re.sub(r"\s+", " ", name).strip(" -,/()")
+        if 2 <= len(name) <= 80:
+            out["client_name"] = name.title() if name.isupper() else name
+    dob = find(r"(?:DATE OF BIRTH|Date of Birth|DOB)\s*[:\n ]+([0-9]{1,2}[\-/ ][0-9A-Za-z]{1,9}[\-/ ][0-9]{2,4})", text)
+    if dob:
+        out["dob"] = parse_date_ddmmyyyy(dob)
+    gender = find(r"(?:SEX|Gender)\s*[:\n ]+(MALE|FEMALE|M|F)\b", text)
+    if gender:
+        out["gender"] = "Female" if gender.upper().startswith("F") else "Male"
+    nat = find(r"(?:NATIONALITY\s*/\s*CITIZENSHIP|NATIONALITY|CITIZENSHIP)\s*[:\n ]+([A-Z ]{3,40})", text)
+    if nat:
+        out["nationality"] = normalise_nationality(nat, nric)
+    pob = find(r"(?:PLACE OF BIRTH|Country/Place of birth|Country of Birth)\s*[:\n ]+([A-Z ]{3,40})", text)
+    if pob:
+        out["birthplace"] = clean(pob).title() if pob.isupper() else clean(pob)
+    addr = find(r"(?:ADDRESS|Address)\s*[:\n ]+(.{5,160}?SINGAPORE\s*\d{6})", text)
+    if addr:
+        addr = re.sub(r"\s+", " ", addr).strip()
+        out["residential_address"] = addr.upper()
+        pc = find(r"SINGAPORE\s*(\d{6})", addr)
+        if pc:
+            out["postal"] = pc
+    return {k: clean(v) for k, v in out.items() if clean(v)}
+
+
+def render_first_page_image(path: Path, max_px: int = 1800) -> tuple[str, str] | tuple[None, None]:
+    """Return (mime, base64) for first page / image, downscaled for OpenAI vision."""
+    try:
+        from PIL import Image
+        import io
+        if path.suffix.lower() == ".pdf":
+            doc = fitz.open(str(path))
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+        else:
+            im = Image.open(path).convert("RGB")
+        im.thumbnail((max_px, max_px))
+        bio = io.BytesIO()
+        im.save(bio, format="JPEG", quality=88)
+        return "image/jpeg", base64.b64encode(bio.getvalue()).decode("ascii")
+    except Exception:
+        return None, None
+
+
+def local_ocr_id(path: Path) -> str:
+    """Best-effort local OCR if tesseract happens to be available. Safe to fail on Railway."""
+    try:
+        import pytesseract
+        from PIL import Image, ImageEnhance
+        if path.suffix.lower() == ".pdf":
+            doc = fitz.open(str(path))
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(5, 5), alpha=False)
+            base = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+        else:
+            base = Image.open(path).convert("RGB")
+        variants = [base, base.convert("L"), ImageEnhance.Contrast(base.convert("L")).enhance(1.8)]
+        parts = []
+        for im in variants:
+            for psm in (6, 11, 3):
+                try:
+                    txt = pytesseract.image_to_string(im, config=f"--psm {psm}")
+                    if txt and txt not in parts:
+                        parts.append(txt)
+                except Exception:
+                    continue
+        return clean("\n".join(parts))
+    except Exception:
+        return ""
+
+
+def openai_vision_extract_id(path: Path) -> dict[str, str]:
+    """Use OpenAI vision to read NRIC/ID/passport scans when normal PDF text extraction cannot."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {}
+    mime, b64 = render_first_page_image(path)
+    if not b64:
+        return {}
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_VISION_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+        prompt = (
+            "Extract the visible details from this Singapore NRIC/ID/passport image. "
+            "Return only JSON with these keys when visible: client_name, nric, dob, gender, "
+            "nationality, birthplace, residential_address, postal. Use exact document text. "
+            "For dob use DD/MM/YYYY. Do not guess unreadable details."
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            max_tokens=600,
+            messages=[{"role":"user","content":[
+                {"type":"text","text":prompt},
+                {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}},
+            ]}],
+        )
+        content = resp.choices[0].message.content or "{}"
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        obj = json.loads(m.group(0) if m else content)
+        out = {k: clean(v) for k, v in obj.items() if clean(v)}
+        if out.get("nric"):
+            out["nric"] = normalise_nric_from_text(out["nric"])
+        if out.get("dob"):
+            out["dob"] = parse_date_ddmmyyyy(out["dob"])
+        if out.get("nationality"):
+            out["nationality"] = normalise_nationality(out["nationality"], out.get("nric", ""))
+        return {k: v for k, v in out.items() if v}
+    except Exception:
+        return {}
+
+
+def extract_id_document(path: Path) -> dict[str, str]:
+    """Extract key personal details from the uploaded Client NRIC / ID file."""
+    if not path:
+        return {}
+    combined = ""
+    if path.suffix.lower() == ".pdf":
+        combined = pdf_text(path, max_pages=1)
+    parsed = parse_id_text(combined)
+    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("residential_address"):
+        ocr_text = local_ocr_id(path)
+        if ocr_text:
+            parsed.update({k: v for k, v in parse_id_text(combined + "\n" + ocr_text).items() if v})
+    # If local extraction still misses core fields, use OpenAI vision on the ID itself.
+    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("client_name"):
+        vision = openai_vision_extract_id(path)
+        for k, v in vision.items():
+            if v and (k in {"nric", "dob", "gender", "nationality", "birthplace", "residential_address", "postal"} or not parsed.get(k)):
+                parsed[k] = v
+    if parsed.get("nationality"):
+        parsed["nationality"] = normalise_nationality(parsed["nationality"], parsed.get("nric", ""))
+    return parsed
+
 def find(pattern: str, text: str, flags: int = re.I | re.S, default: str = "") -> str:
     m = re.search(pattern, text, flags)
     return clean(m.group(1)) if m else default
@@ -164,6 +335,11 @@ def extract_from_bi(text: str, fields: dict[str, str]) -> dict[str, Any]:
     data["age_last_birthday"] = clean(find(r"Age Last Birthday\s*:\s*(\d+)", text))
     data["policy_term"] = clean(find(r"Manulife InvestReady[^\n]*\s+(Up to age 99)\s+(\d+)\s+", text)) or "Up to 99 years"
     data["premium_term"] = clean(find(r"Manulife InvestReady[^\n]*Up to age 99\s+(\d+)\s+", text))
+    fa_match = re.search(r"\nDate\s*\n([A-Z][A-Z \n().,'/-]{3,80}?)\nDate\s*\nThis illustration", text, flags=re.S)
+    if fa_match:
+        fa = clean(" ".join(line.strip() for line in fa_match.group(1).splitlines() if line.strip()))
+        if fa and not re.search(r"^(MR|MDM|MS|MRS)\b", fa, re.I):
+            data["adviser_name_from_bi"] = fa
     # Common known FWD plan text fallback
     if re.search(r"FWD|Invest Flexi Elite", text, re.I) and not data.get("plan_name"):
         data["plan_name"] = "FWD Invest Flexi Elite"
@@ -184,7 +360,9 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "") -
     data["gender"] = data.get("gender") or ("Female" if re.search(r"\bFEMALE\b", text, re.I) else ("Male" if re.search(r"\bMALE\b", text, re.I) else ""))
     data["marital_status"] = "Widowed" if fields.get("Widowed") or fields.get("checkbox_widowed") else ("Married" if fields.get("Married") or fields.get("checkbox_married") else ("Single" if fields.get("Single") or fields.get("checkbox_single") else ""))
     data["residential_address"] = first_field(fields, "Residential Address", "residential_address", "is no residential address in the identification document 1") or find(r"ADDRESS\s*\n?(.+?SINGAPORE\s*\d{6})", text)
-    data["postal"] = first_field(fields, "Postal Code", "postal") or find(r"SINGAPORE\s*(\d{6})", data.get("residential_address", "") or text)
+    data["postal"] = first_field(fields, "Postal Code", "postal")
+    if not data.get("postal") and data.get("residential_address"):
+        data["postal"] = find(r"SINGAPORE\s*(\d{6})", data.get("residential_address", ""))
     data["mobile"] = first_field(fields, "Mobile No", "Mobile Number", "mobile_number", "undefined_7")
     data["client_email"] = first_field(fields, "Email Address", "email", "undefined_8")
     data["occupation"] = first_field(fields, "Occupation", "occupation", "undefined_9")
@@ -201,7 +379,7 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "") -
         if not data.get("age_next") and data.get("dob"):
             data["age_next"] = age_next_birthday(data["dob"])
     data["adviser_email"] = adviser_email
-    data["adviser_name"] = first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
+    data["adviser_name"] = data.get("adviser_name_from_bi") or first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
     data["fa_source_code"] = first_field(fields, "sourcecode", "Representatives Code 1")
     # Fund allocation if found in Manulife application.
     data["fund_code"] = first_field(fields, "Fund CodeRow1")
@@ -264,6 +442,18 @@ def recommendation_text(data: dict[str, Any], product_type: str, expected_retire
 def build_case(paths: list[Path], adviser_email: str, product_type: str, expected_retirement_income: str = "") -> dict[str, Any]:
     text, fields = all_text_and_fields(paths)
     data = extract_client(text, fields, adviser_email)
+    # The first uploaded file is the Client NRIC / ID. Prefer it for ID fields,
+    # because BI PDFs often do not contain the NRIC and scanned IDs need OCR/vision.
+    id_data = extract_id_document(paths[0]) if paths else {}
+    for key, val in id_data.items():
+        if not val:
+            continue
+        if key in {"nric", "dob", "gender", "nationality", "birthplace", "residential_address", "postal"}:
+            data[key] = val
+        elif not data.get(key):
+            data[key] = val
+    if data.get("dob") and not data.get("age_next"):
+        data["age_next"] = age_next_birthday(data["dob"])
     data["product_type"] = product_type
     data["expected_retirement_income"] = expected_retirement_income
     data.update(retirement_calc(expected_retirement_income, data.get("cpf_life_income", "")))
