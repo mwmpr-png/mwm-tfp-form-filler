@@ -39,51 +39,81 @@ def set_need_appearances(writer: PdfWriter) -> None:
         pass
 
 
-def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None) -> Path:
-    reader = PdfReader(str(template))
-    writer = PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
-    if "/AcroForm" in reader.trailer["/Root"]:
-        writer._root_object.update({NameObject("/AcroForm"): reader.trailer["/Root"]["/AcroForm"]})
-    checkbox_values = checkbox_values or {}
-    all_values = {**{k: str(v) for k, v in field_values.items() if v is not None}, **checkbox_values}
-    # Traverse widgets and set values manually so checkboxes/radio buttons keep their export values.
-    for page in writer.pages:
-        annots = page.get("/Annots")
-        if not annots:
-            continue
-        for aref in annots:
-            try:
-                annot = aref.get_object()
-                name = annot.get("/T")
-                parent = annot.get("/Parent")
-                if not name and parent:
-                    name = parent.get_object().get("/T")
-                if not name or str(name) not in all_values:
-                    continue
-                key = str(name)
-                value = str(all_values[key])
-                ft = annot.get("/FT") or (parent.get_object().get("/FT") if parent else None)
-                if ft == "/Btn":
-                    val = value if value.startswith("/") else "/" + value
-                    annot.update({NameObject("/AS"): NameObject(val)})
-                    target = parent.get_object() if parent else annot
-                    target.update({NameObject("/V"): NameObject(val)})
-                else:
-                    annot.update({NameObject("/V"): TextStringObject(value)})
-                    if parent:
-                        parent.get_object().update({NameObject("/V"): TextStringObject(value)})
-            except Exception:
-                continue
-    set_need_appearances(writer)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "wb") as f:
-        writer.write(f)
-    # Draw visible appearances as a safety layer. The underlying fields remain editable.
-    overlay_visible_values(template, output, all_values)
-    return output
+def _fitz_font_size(value: str, rect) -> float:
+    """Choose a conservative font size so filled PDF fields remain editable and readable."""
+    value = str(value or "")
+    w = max(float(rect.x1 - rect.x0), 1.0)
+    h = max(float(rect.y1 - rect.y0), 1.0)
+    n = max(len(value), 1)
+    if h > 120:
+        return 6.2
+    if n > 250:
+        return 5.8
+    if n > 120:
+        return 6.3
+    if h <= 14:
+        return max(5.0, min(7.0, w / n * 1.25))
+    if h <= 20:
+        return max(6.0, min(8.0, w / n * 1.45))
+    if n > 60:
+        return 7.0
+    return 8.0
 
+
+def _checkbox_on_value(widget) -> str:
+    try:
+        states = widget.button_states() or {}
+        normal = states.get("normal") or []
+        for val in normal:
+            if val and str(val).lower() != "off":
+                return str(val)
+    except Exception:
+        pass
+    return "On"
+
+
+def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None) -> Path:
+    """Fill the AcroForm using PyMuPDF widget appearances.
+
+    This keeps the PDF fields editable. Earlier versions stamped a visible text overlay
+    above some fields, which made edits look duplicated/wonky in browser PDF viewers.
+    """
+    checkbox_values = checkbox_values or {}
+    text_values = {str(k): str(v) for k, v in field_values.items() if v is not None and str(v) != ""}
+    check_values = {str(k): str(v) for k, v in checkbox_values.items() if v is not None and str(v) not in ("", "Off", "/Off")}
+    all_names = set(text_values) | set(check_values)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(str(template))
+    for page in doc:
+        widgets = list(page.widgets() or [])
+        for widget in widgets:
+            name = widget.field_name
+            if not name or name not in all_names:
+                continue
+            try:
+                if name in check_values or widget.field_type_string in ("CheckBox", "RadioButton"):
+                    if name in check_values:
+                        widget.field_value = _checkbox_on_value(widget)
+                        widget.update()
+                else:
+                    value = text_values.get(name, "")
+                    widget.field_value = value
+                    try:
+                        widget.text_font = "Helv"
+                    except Exception:
+                        pass
+                    try:
+                        widget.text_fontsize = _fitz_font_size(value, widget.rect)
+                    except Exception:
+                        pass
+                    widget.update()
+            except Exception:
+                # Continue filling other fields even if an individual widget has an issue.
+                continue
+    doc.save(str(output), garbage=4, deflate=True)
+    doc.close()
+    return output
 
 def _field_widgets(template: Path):
     try:
@@ -252,9 +282,9 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "NRIC": nric,
         "NRICS": "",
         # personal particulars
-        "undefined_2": data.get("nationality", "SINGAPORE CITIZEN"),
+        "undefined_2": data.get("nationality", ""),
         "Date of Birth  GG PPP": data.get("dob", ""),
-        "undefined_4": data.get("birthplace", "SINGAPORE"),
+        "undefined_4": data.get("birthplace", ""),
         "Age Next Birthday ANB": data.get("age_next", ""),
         "Residential Address": data.get("residential_address", ""),
         "Postal Code": data.get("postal", ""),
