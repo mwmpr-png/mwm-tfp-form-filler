@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Generated TFP Output</title>
+  <style>
+    :root { --navy:#13264a; --bg:#f5f7fb; --border:#dbe2ea; --text:#0b1730; --gold:#b59b63; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Arial, sans-serif; }
+    .hero { background:#fff; border-bottom:1px solid var(--border); padding:22px 36px; }
+    .hero-inner { max-width:1160px; margin:0 auto; display:flex; align-items:center; gap:22px; }
+    .logo { width:260px; max-width:36vw; height:auto; }
+    .brand-text { letter-spacing:2px; color:var(--gold); font-weight:800; font-size:13px; margin-bottom:6px; }
+    h1 { margin:0; font-size:28px; color:var(--navy); }
+    .wrap { max-width:1000px; margin:34px auto; padding:0 18px; }
+    .card { background:white; border:1px solid var(--border); border-radius:14px; padding:30px; }
+    a.button { display:inline-block; background:var(--navy); color:white; padding:12px 18px; border-radius:8px; text-decoration:none; font-weight:700; margin:8px 8px 8px 0; }
+    .secondary { background:#eef2f8 !important; color:#13264a !important; }
+    .summary { background:#fbfcfe; border:1px solid var(--border); border-radius:10px; padding:18px; margin-top:18px; }
+    iframe { width:100%; height:720px; border:1px solid var(--border); border-radius:10px; background:white; }
+    @media(max-width:760px){ .hero-inner{flex-direction:column; align-items:flex-start;} .logo{max-width:100%; width:240px;} }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="hero-inner">
+      <img src="/static/mwm-logo.jpeg" alt="MWM Massive Wealth Management" class="logo">
+      <div>
+        <div class="brand-text">MASSIVE WEALTH MANAGEMENT</div>
+        <h1>Generated TFP Output</h1>
+      </div>
+    </div>
+  </div>
+  <div class="wrap"><div class="card">
+    <h2>Download Completed TFP</h2>
+    {% for name, url in outputs %}<a class="button" href="{{ url }}" target="_blank">{{ name }}</a>{% endfor %}
+    <br><a class="button secondary" href="{{ zip_url }}">Download as ZIP</a>
+    <div class="summary">
+      <strong>Detected client:</strong> {{ data.client_name or 'Not detected' }}<br>
+      <strong>NRIC:</strong> {{ data.nric or 'Not detected' }}<br>
+      <strong>Plan:</strong> {{ data.plan_name or 'Not detected' }}<br>
+      <strong>Premium:</strong> {{ data.premium or 'Not detected' }}
+    </div>
+    <h2>Preview Completed TFP</h2>
+    {% if outputs %}<iframe src="{{ outputs[0][1] }}"></iframe>{% endif %}
+  </div></div>
+</body>
+</html>

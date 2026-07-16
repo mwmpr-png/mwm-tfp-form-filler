@@ -1,0 +1,175 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ai TFP Form Filler</title>
+  <style>
+    :root {
+      --navy:#13264a;
+      --blue:#006f9f;
+      --gold:#b59b63;
+      --bg:#f5f7fb;
+      --border:#dbe2ea;
+      --text:#0b1730;
+      --muted:#5b6575;
+      --success:#16834a;
+      --notice:#f7f9fc;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family: Arial, sans-serif; }
+    .hero { background:#ffffff; border-bottom:1px solid var(--border); padding:14px 28px; }
+    .hero-inner { max-width:1120px; margin:0 auto; display:flex; align-items:center; gap:22px; }
+    .logo { width:260px; max-width:34vw; height:auto; display:block; }
+    .brand-text { letter-spacing:2px; color:var(--navy); font-weight:800; font-size:14px; margin-bottom:5px; }
+    h1 { margin:0; font-size:30px; color:var(--navy); letter-spacing:.2px; }
+    .wrap { max-width:1000px; margin:18px auto; padding:0 18px; }
+    .card { background:white; border:1px solid var(--border); border-radius:16px; padding:22px 24px; box-shadow:0 1px 2px rgba(10,30,60,.04); }
+    .card-head { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:10px; }
+    h2 { margin:0; font-size:21px; }
+    .required-note { color:#7a4f00; background:#fff8e8; border:1px solid #f0dfb8; border-radius:999px; padding:7px 12px; font-size:13px; white-space:nowrap; }
+    .internal { margin:0 0 12px; border-left:4px solid var(--navy); background:var(--notice); padding:10px 12px; border-radius:9px; color:#334156; font-size:13px; line-height:1.35; }
+    label { display:block; font-weight:700; margin:10px 0 6px; font-size:14px; }
+    .req { color:#d12d2d; }
+    input, select { width:100%; padding:11px 12px; border:1px solid var(--border); border-radius:9px; font-size:14px; background:white; }
+    select { cursor:pointer; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px 16px; }
+    .full { grid-column:1 / -1; }
+    .money-wrap { position:relative; }
+    .money-prefix { position:absolute; left:12px; top:50%; transform:translateY(-50%); color:#3f4d63; font-weight:700; }
+    .money-wrap input { padding-left:40px; }
+    .upload { border:1.5px dashed var(--border); background:#fbfcfe; border-radius:10px; padding:9px 10px; display:flex; align-items:center; justify-content:space-between; gap:10px; min-height:44px; transition:.15s ease; }
+    .upload:hover { border-color:var(--blue); background:#f7fbff; }
+    .file-input { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+    .file-status { color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:360px; }
+    .upload-btn { margin:0; display:inline-flex; align-items:center; gap:8px; border:1px solid var(--navy); color:var(--navy); background:#fff; border-radius:8px; padding:8px 12px; font-weight:700; cursor:pointer; white-space:nowrap; font-size:13px; }
+    .upload.uploaded { border-color:#b7dfc7; background:#f6fff9; }
+    .upload.uploaded .file-status { color:var(--success); font-weight:700; }
+    .upload.uploaded .file-status::before { content:"✓ "; }
+    .actions { display:flex; justify-content:flex-end; align-items:center; margin-top:16px; }
+    .btn { background:var(--navy); color:white; border:0; border-radius:9px; padding:13px 28px; font-weight:700; font-size:15px; cursor:pointer; }
+    @media(max-width:760px){
+      .hero { padding:18px 20px; }
+      .hero-inner { flex-direction:column; align-items:flex-start; gap:12px; }
+      .logo { max-width:100%; width:250px; }
+      .grid{grid-template-columns:1fr;}
+      .card-head { flex-direction:column; align-items:flex-start; }
+      .required-note { white-space:normal; }
+      .upload { flex-direction:column; align-items:stretch; }
+      .upload-btn { justify-content:center; }
+      .actions { justify-content:stretch; }
+      .btn { width:100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="hero-inner">
+      <img src="/static/mwm-logo.jpeg" alt="MWM Massive Wealth Management" class="logo">
+      <div>
+        <div class="brand-text">MASSIVE WEALTH MANAGEMENT</div>
+        <h1>Ai TFP Form Filler</h1>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <form class="card" action="/generate" method="post" enctype="multipart/form-data">
+      <div class="card-head">
+        <h2>Upload documents</h2>
+        <div class="required-note"><span class="req">*</span> denotes compulsory field</div>
+      </div>
+
+      <div class="internal">
+        <strong>Internal use only:</strong> This form filler is intended strictly for use within Massive Wealth Management (MWM). It should never be shared with anyone outside the team.
+      </div>
+
+      <div class="grid">
+        <div>
+          <label>Adviser Email <span class="req">*</span></label>
+          <input type="email" name="adviser_email" placeholder="name@promiseland.com.sg" required>
+        </div>
+        <div>
+          <label>Product Type <span class="req">*</span></label>
+          <select name="product_type" required>
+            <option value="Manulife">Manulife</option>
+            <option value="FWD">FWD</option>
+          </select>
+        </div>
+
+        <div>
+          <label>Client NRIC / ID <span class="req">*</span></label>
+          <div class="upload" data-upload-box>
+            <div class="file-status" data-file-status>No file uploaded</div>
+            <label class="upload-btn">Upload file<input class="file-input" type="file" name="nric_file" accept=".pdf,.png,.jpg,.jpeg" required></label>
+          </div>
+        </div>
+
+        <div>
+          <label>Benefits Illustration <span class="req">*</span></label>
+          <div class="upload" data-upload-box>
+            <div class="file-status" data-file-status>No file uploaded</div>
+            <label class="upload-btn">Upload file<input class="file-input" type="file" name="bi_file" accept=".pdf,.png,.jpg,.jpeg" required></label>
+          </div>
+        </div>
+
+        <div class="full">
+          <label>Client's expected Retirement Income (Yearly)</label>
+          <div class="money-wrap">
+            <span class="money-prefix">S$</span>
+            <input type="text" name="expected_retirement_income" placeholder="Example: 60000">
+          </div>
+        </div>
+
+        <div>
+          <label>FA Signature</label>
+          <div class="upload" data-upload-box>
+            <div class="file-status" data-file-status>No file uploaded</div>
+            <label class="upload-btn">Upload file<input class="file-input" type="file" name="fa_signature" accept=".png,.jpg,.jpeg"></label>
+          </div>
+        </div>
+        <div>
+          <label>Client Signature</label>
+          <div class="upload" data-upload-box>
+            <div class="file-status" data-file-status>No file uploaded</div>
+            <label class="upload-btn">Upload file<input class="file-input" type="file" name="client_signature" accept=".png,.jpg,.jpeg"></label>
+          </div>
+        </div>
+
+        <div class="full">
+          <label>Any other documents</label>
+          <div class="upload" data-upload-box>
+            <div class="file-status" data-file-status>No file uploaded</div>
+            <label class="upload-btn">Upload file<input class="file-input" type="file" name="other_documents" accept=".pdf,.png,.jpg,.jpeg" multiple></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn" type="submit">Submit</button>
+      </div>
+    </form>
+  </div>
+
+  <script>
+    document.querySelectorAll('[data-upload-box]').forEach(function(box) {
+      var input = box.querySelector('input[type="file"]');
+      var status = box.querySelector('[data-file-status]');
+      input.addEventListener('change', function() {
+        var files = Array.from(input.files || []);
+        if (!files.length) {
+          box.classList.remove('uploaded');
+          status.textContent = 'No file uploaded';
+          return;
+        }
+        box.classList.add('uploaded');
+        if (files.length === 1) {
+          status.textContent = files[0].name;
+        } else {
+          status.textContent = files.length + ' files uploaded: ' + files.map(function(f){ return f.name; }).join(', ');
+        }
+      });
+    });
+  </script>
+</body>
+</html>
