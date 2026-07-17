@@ -21,6 +21,8 @@ app = FastAPI(title="MWM Ai TFP Form Filler")
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "app" / "static")), name="static")
 templates = Jinja2Templates(directory=str(PROJECT_ROOT / "app" / "templates"))
 
+FWD_ONLINE_SUBMISSION_URL = "https://cusso.fwd.com.sg/u/login/identifier?state=hKFo2SA1dEV0U1RZVEc0QnpMUEx4RHlkN0ZVMi1SZl8xRTI0dqFur3VuaXZlcnNhbC1sb2dpbqN0aWTZIGpraEN5MTkxakNnWFl3NUhVYm1jM2p4YksybmExWHhvo2NpZNkgV3FnVzRQTWZmNHJRblJJN3pwQUV2cXVtakNQQnVoMnk"
+
 
 def safe_name(name: str) -> str:
     import re
@@ -85,23 +87,45 @@ async def generate(
     except Exception: pass
 
     # Output package: completed editable TFP plus product-specific insurer documents.
-    # Manulife generates Manulife GIO Application + Manulife NFTF.
-    # HSBC generates HSBC GIO Application + Customer Acknowledgement + E-Signing Consent + HSBC NFTF.
+    # Manulife generates TFP + Manulife GIO Application + Manulife NFTF.
+    # FWD generates TFP only, plus an on-screen/link notice to complete FWD submission online.
+    # HSBC generates TFP + HSBC GIO Application + Customer Acknowledgement + E-Signing Consent + HSBC NFTF.
     insurer_outputs = generate_insurer_forms(product_type, data, job_dir, client, client_sig_path, fa_sig_path)
     outputs = [tfp_out] + insurer_outputs
+
+    notice_outputs: list[Path] = []
+    fwd_prompt = None
+    if product_type.strip().lower() == "fwd":
+        fwd_prompt = {
+            "title": "FWD online submission required",
+            "message": "For FWD cases, this tool generates the completed TFP only. Please proceed to the FWD online platform to complete the GIO / application submission.",
+            "url": FWD_ONLINE_SUBMISSION_URL,
+        }
+        notice = job_dir / f"{client}_FWD_Online_Submission_Link.txt"
+        notice.write_text(
+            "FWD online submission required\n\n"
+            "This tool has generated the completed TFP for the FWD case.\n"
+            "Please proceed to the FWD online platform to complete the GIO / application submission:\n"
+            f"{FWD_ONLINE_SUBMISSION_URL}\n",
+            encoding="utf-8",
+        )
+        notice_outputs.append(notice)
 
     audit = job_dir / f"{client}_extraction_audit.json"
     audit.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     zip_path = job_dir / f"{client}_TFP_and_Insurer_Output_Package.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in outputs:
+        for p in outputs + notice_outputs:
             z.write(p, p.name)
 
     return templates.TemplateResponse(request=request, name="result.html", context={
         "job_id": job_id,
         "client": data.get("client_name", "Client"),
+        "product_type": product_type,
         "outputs": [(p.name, f"/download/{job_id}/{p.name}") for p in outputs if p.suffix.lower() == ".pdf"],
+        "notice_outputs": [(p.name, f"/download/{job_id}/{p.name}") for p in notice_outputs],
+        "fwd_prompt": fwd_prompt,
         "audit_url": f"/download/{job_id}/{audit.name}",
         "zip_url": f"/download/{job_id}/{zip_path.name}",
         "data": data,
