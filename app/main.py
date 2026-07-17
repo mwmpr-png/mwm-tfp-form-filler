@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 
 from .extractor import build_case
 from .pdf_fill import fill_pdf, stamp_signatures, tfp_field_map
+from .insurer_fill import generate_insurer_forms
 from .settings import PROJECT_ROOT, TEMPLATE_DIR, UPLOADS_DIR, OUTPUTS_DIR
 
 app = FastAPI(title="MWM Ai TFP Form Filler")
@@ -39,7 +40,7 @@ async def save_upload(upload: UploadFile | None, dest: Path) -> Path | None:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html", context={})
 
 
 @app.post("/generate", response_class=HTMLResponse)
@@ -83,21 +84,21 @@ async def generate(
     try: tfp_tmp.unlink()
     except Exception: pass
 
-    # v1 live output: completed editable TFP only.
-    # Checklist, Special Disclosure and NFTF templates are retained in the project
-    # for future use / reference, but are intentionally not generated for users.
-    outputs = [tfp_out]
+    # Output package: completed editable TFP plus product-specific insurer documents.
+    # Manulife generates Manulife GIO Application + Manulife NFTF.
+    # HSBC generates HSBC GIO Application + Customer Acknowledgement + E-Signing Consent + HSBC NFTF.
+    insurer_outputs = generate_insurer_forms(product_type, data, job_dir, client, client_sig_path, fa_sig_path)
+    outputs = [tfp_out] + insurer_outputs
 
     audit = job_dir / f"{client}_extraction_audit.json"
     audit.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    zip_path = job_dir / f"{client}_TFP_Output_Package.zip"
+    zip_path = job_dir / f"{client}_TFP_and_Insurer_Output_Package.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for p in outputs:
             z.write(p, p.name)
 
-    return templates.TemplateResponse("result.html", {
-        "request": request,
+    return templates.TemplateResponse(request=request, name="result.html", context={
         "job_id": job_id,
         "client": data.get("client_name", "Client"),
         "outputs": [(p.name, f"/download/{job_id}/{p.name}") for p in outputs if p.suffix.lower() == ".pdf"],

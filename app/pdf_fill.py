@@ -72,7 +72,7 @@ def _checkbox_on_value(widget) -> str:
     return "On"
 
 
-def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None) -> Path:
+def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None, clear_existing: bool = False) -> Path:
     """Fill the AcroForm using PyMuPDF widget appearances.
 
     This keeps the PDF fields editable. Earlier versions stamped a visible text overlay
@@ -89,9 +89,19 @@ def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbo
         widgets = list(page.widgets() or [])
         for widget in widgets:
             name = widget.field_name
-            if not name or name not in all_names:
+            if not name:
                 continue
             try:
+                if clear_existing:
+                    # This is required when a previously completed PDF is used as a clean fillable template.
+                    # We clear every widget first so old client data cannot remain in untouched fields.
+                    if widget.field_type_string in ("CheckBox", "RadioButton"):
+                        widget.field_value = False
+                    else:
+                        widget.field_value = ""
+                    widget.update()
+                if name not in all_names:
+                    continue
                 if name in check_values or widget.field_type_string in ("CheckBox", "RadioButton"):
                     if name in check_values:
                         widget.field_value = _checkbox_on_value(widget)
@@ -268,8 +278,8 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     cpf_total = money_number(data.get("cpf_total", ""))
     total_assets = cpf_total + money_number(data.get("other_assets", ""))
     retirement = data.get("expected_retirement_income", "")
-    plan = data.get("plan_name") or ("Manulife InvestReady (III)" if product_type == "Manulife" else "FWD Invest Flexi Elite")
-    insurer = "Manulife" if product_type == "Manulife" else "FWD"
+    plan = data.get("plan_name") or ("Manulife InvestReady (III)" if product_type == "Manulife" else ("HSBC Life Indexed Flexi Income" if product_type == "HSBC" else "FWD Invest Flexi Elite"))
+    insurer = "Manulife" if product_type == "Manulife" else ("HSBC Life" if product_type == "HSBC" else "FWD")
     fund_name = data.get("fund_name", "")
     fund_code = data.get("fund_code", "")
     today = today_ddmmyyyy()
@@ -324,8 +334,8 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "fill_23": fmt_money(money_number(premium), compact=True) + ("/YEAR" if premium else ""),
         "UT 1": "ILP",
         "RSP 1": "100%" if fund_name else "",
-        "Name of Fund Manager  Investment Product1": fund_name or ("Selected ILP fund(s)" if product_type == "FWD" else ""),
-        "Asset Class": "B" if product_type == "Manulife" else "MIXED",
+        "Name of Fund Manager  Investment Product1": fund_name or ("Selected index account(s)" if product_type == "HSBC" else ("Selected ILP fund(s)" if product_type == "FWD" else "")),
+        "Asset Class": "B" if product_type == "Manulife" else ("M" if product_type == "HSBC" else "MIXED"),
         "Text37": "Saving and investing to achieve capital gains and potentially higher returns.",
         "Text38": "Up to 99 years" if product_type == "Manulife" else "Till Age 100",
         "Text39": f"{plan} is an investment-linked plan designed to provide investment opportunities with insurance coverage and flexibility to meet changing financial needs.",

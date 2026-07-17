@@ -291,6 +291,79 @@ def title_name_from_email(email: str) -> str:
     return name.upper() if name else ""
 
 
+def split_client_name(name: str) -> tuple[str, str]:
+    parts = clean(name).split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0].upper(), ""
+    return parts[0].upper(), " ".join(parts[1:]).upper()
+
+
+def extract_hsbc_tfp_personal(text: str) -> dict[str, Any]:
+    """Best-effort extraction from completed HSBC/TFP examples where PDF form fields are absent."""
+    out: dict[str, Any] = {}
+    # Common sequence in completed TFP: name, NRIC, nationality, DOB, birthplace, then gender/smoker/marital rows.
+    m = re.search(r"Name\s*\nNRIC\s*/\s*FIN\s*/\s*Passport No\.\s*\nNationality\s*\nDate of Birth[^\n]*\nPlace of Birth[\s\S]{0,120}?\n\s*([A-Z][A-Za-z ,.'-]{2,80})\s*\n\s*([STFG]\d{7}[A-Z])\s*\n\s*([A-Z ]{3,30})\s*\n\s*(\d{1,2}/\d{1,2}/\d{4})\s*\n\s*([A-Z ]{3,30})", text, flags=re.I)
+    if m:
+        out["client_name"] = clean(m.group(1)).title()
+        out["nric"] = m.group(2).upper()
+        out["nationality"] = normalise_nationality(m.group(3), out["nric"])
+        out["dob"] = parse_date_ddmmyyyy(m.group(4))
+        out["birthplace"] = clean(m.group(5)).title()
+    # Fallback for HSBC GIO text: surname and given name are separated.
+    if not out.get("client_name"):
+        m = re.search(r"Last Name/Surname\s*\n\s*First/Given Name[\s\S]{0,120}?\n\s*([A-Z][A-Z'-]+)\s*\n\s*([A-Z][A-Z\s'-]+)\s*\n", text, flags=re.I)
+        if m:
+            out["client_name"] = clean(m.group(1) + " " + m.group(2)).title()
+    if not out.get("nric"):
+        nric = normalise_nric_from_text(text)
+        if nric:
+            out["nric"] = nric
+    if not out.get("dob"):
+        dob = find(r"Date of birth\s*\(dd/mm/yyyy\)\s*\n\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text)
+        if dob:
+            out["dob"] = parse_date_ddmmyyyy(dob)
+    if not out.get("residential_address"):
+        m = re.search(r"Residential Address[\s\S]{0,420}?\n\s*([A-Z0-9 #,.'/-]+SINGAPORE)\s*\n\s*Postal Code\s*\n\s*(\d{6})", text, flags=re.I)
+        if m:
+            out["residential_address"] = clean(m.group(1)).upper()
+            out["postal"] = m.group(2)
+    if not out.get("mobile"):
+        mob = find(r"Mobile Number\s*\nEmail Address[\s\S]{0,80}?\n\s*([689]\d{7})", text)
+        if mob:
+            out["mobile"] = mob
+    if not out.get("client_email"):
+        email = find(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, flags=re.I)
+        if email:
+            out["client_email"] = email
+    if re.search(r"\bFemale\b|IZl Female|\[Z\]\s*Female|Female\s*\n", text, flags=re.I):
+        out.setdefault("gender", "Female")
+    elif re.search(r"\bMale\b", text, flags=re.I):
+        out.setdefault("gender", "Male")
+    if re.search(r"\bMarried\b", text, flags=re.I):
+        out.setdefault("marital_status", "Married")
+    plan = find(r"I recommend the\s+([^\n]+)", text) or find(r"Product\s*Name\s*[:\n ]+([^\n]+)", text)
+    if plan:
+        out["plan_name"] = clean(plan)
+    if re.search(r"HSBC Life Indexed Flexi Income", text, re.I):
+        out.setdefault("plan_name", "HSBC Life Indexed Flexi Income")
+    if re.search(r"Diamond Prestige|IUL", text, re.I):
+        out.setdefault("plan_name", "HSBC Life Diamond Prestige IUL II")
+    prem = find(r"US\$\s*([0-9,]+(?:\.\d+)?)\s+single premium", text) or find(r"single premium policy\s+using.*?US\$\s*([0-9,]+)", text) or find(r"Premium\s*Amount\s*[:\n ]+\$?([0-9,]+(?:\.\d+)?)", text)
+    if prem:
+        out["premium"] = prem
+        out.setdefault("currency", "USD" if "US$" in text[:max(text.find(prem)+10, 0)] or "USD" in text else "SGD")
+    # Completed HSBC GIO examples often have the consultant name/code visible.
+    fa = find(r"Financial Consultant's name\s*\n\s*([^\n]+)", text)
+    code = find(r"Financial Consultant's code\s*\n\s*([0-9A-Za-z]+)", text)
+    if fa and not re.search(r"Financial Consultant|Organisation", fa, re.I):
+        out["adviser_name_from_hsbc"] = clean(fa)
+    if code:
+        out["fa_source_code"] = code
+    return {k: clean(v) for k, v in out.items() if clean(v)}
+
+
 def parse_date_ddmmyyyy(raw: str) -> str:
     raw = clean(raw)
     if not raw:
@@ -340,9 +413,17 @@ def extract_from_bi(text: str, fields: dict[str, str]) -> dict[str, Any]:
         fa = clean(" ".join(line.strip() for line in fa_match.group(1).splitlines() if line.strip()))
         if fa and not re.search(r"^(MR|MDM|MS|MRS)\b", fa, re.I):
             data["adviser_name_from_bi"] = fa
-    # Common known FWD plan text fallback
+    # Common known HSBC / FWD plan text fallbacks
+    if re.search(r"HSBC Life Indexed Flexi Income", text, re.I) and not data.get("plan_name"):
+        data["plan_name"] = "HSBC Life Indexed Flexi Income"
+    if re.search(r"HSBC Life Diamond Prestige|Diamond Prestige IUL|IUL II", text, re.I) and not data.get("plan_name"):
+        data["plan_name"] = "HSBC Life Diamond Prestige IUL II"
     if re.search(r"FWD|Invest Flexi Elite", text, re.I) and not data.get("plan_name"):
         data["plan_name"] = "FWD Invest Flexi Elite"
+    hsbc_extra = extract_hsbc_tfp_personal(text)
+    for k, v in hsbc_extra.items():
+        if v and not data.get(k):
+            data[k] = v
     return {k: v for k, v in data.items() if v}
 
 
@@ -379,7 +460,7 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "") -
         if not data.get("age_next") and data.get("dob"):
             data["age_next"] = age_next_birthday(data["dob"])
     data["adviser_email"] = adviser_email
-    data["adviser_name"] = data.get("adviser_name_from_bi") or first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
+    data["adviser_name"] = data.get("adviser_name_from_bi") or data.get("adviser_name_from_hsbc") or first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
     data["fa_source_code"] = first_field(fields, "sourcecode", "Representatives Code 1")
     # Fund allocation if found in Manulife application.
     data["fund_code"] = first_field(fields, "Fund CodeRow1")
@@ -414,7 +495,7 @@ def retirement_calc(expected_yearly: str, cpf_life_yearly: str = "") -> dict[str
 def recommendation_text(data: dict[str, Any], product_type: str, expected_retirement_income: str) -> str:
     client = data.get("client_name", "Client")
     age = data.get("age_next") or data.get("age_last_birthday") or ""
-    plan = data.get("plan_name") or ("Manulife InvestReady (III) 10 Years Flexi 3" if product_type == "Manulife" else "FWD Invest Flexi Elite")
+    plan = data.get("plan_name") or ("Manulife InvestReady (III) 10 Years Flexi 3" if product_type == "Manulife" else ("HSBC Life Indexed Flexi Income" if product_type == "HSBC" else "FWD Invest Flexi Elite"))
     premium = norm_money(data.get("premium") or "")
     yearly = fmt_money(money_number(expected_retirement_income)) if expected_retirement_income else ""
     cpf = data.get("cpf_total", "")
@@ -432,6 +513,8 @@ def recommendation_text(data: dict[str, Any], product_type: str, expected_retire
     base.append("The client has been informed that returns, dividends and surrender values are not guaranteed. Fund prices may go up or down and past performance is not indicative of future performance.")
     if product_type == "Manulife":
         base.append("For Manulife InvestReady (III) 10 Years Flexi 3, client has the flexibility to pay premiums for the first 3 policy years or continue to contribute thereafter. Client has also been informed that withdrawals or surrender within the first 10 policy years may incur applicable surrender / withdrawal charges.")
+    elif product_type == "HSBC":
+        base.append("For the HSBC Life plan, client has been informed of the plan structure, premium commitment, policy currency, surrender terms, charges, non-guaranteed elements, investment/index-linked risks where applicable, and the relevant HSBC application documents before deciding to proceed.")
     else:
         base.append("For FWD Invest Flexi Elite, client has been informed of the plan features, premium commitment, flexibility, charges and investment risks before deciding to proceed.")
     base.append("The investment exposure remains within the client's disclosed financial position and the client has indicated sufficient liquidity to continue with the proposed arrangement.")
