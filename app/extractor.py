@@ -183,14 +183,16 @@ def render_first_page_image(path: Path, max_px: int = 1800) -> tuple[str, str] |
 
 
 def local_ocr_id(path: Path) -> str:
-    """Best-effort local OCR if tesseract happens to be available. Safe to fail on Railway."""
+    """Best-effort local OCR only when explicitly enabled. Disabled by default on Railway because it can time out."""
+    if os.getenv("ENABLE_LOCAL_OCR", "").lower() not in {"1", "true", "yes"}:
+        return ""
     try:
         import pytesseract
         from PIL import Image, ImageEnhance
         if path.suffix.lower() == ".pdf":
             doc = fitz.open(str(path))
             page = doc[0]
-            pix = page.get_pixmap(matrix=fitz.Matrix(5, 5), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False)
             base = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             doc.close()
         else:
@@ -260,16 +262,18 @@ def extract_id_document(path: Path) -> dict[str, str]:
     if path.suffix.lower() == ".pdf":
         combined = pdf_text(path, max_pages=1)
     parsed = parse_id_text(combined)
-    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("residential_address"):
-        ocr_text = local_ocr_id(path)
-        if ocr_text:
-            parsed.update({k: v for k, v in parse_id_text(combined + "\n" + ocr_text).items() if v})
-    # If local extraction still misses core fields, use OpenAI vision on the ID itself.
+    # If normal PDF text extraction misses core fields, use OpenAI vision on the ID itself.
+    # This is faster and more predictable than local OCR on Railway.
     if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("client_name"):
         vision = openai_vision_extract_id(path)
         for k, v in vision.items():
             if v and (k in {"nric", "dob", "gender", "nationality", "birthplace", "residential_address", "postal"} or not parsed.get(k)):
                 parsed[k] = v
+    # Optional fallback only when ENABLE_LOCAL_OCR=1 is set.
+    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("residential_address"):
+        ocr_text = local_ocr_id(path)
+        if ocr_text:
+            parsed.update({k: v for k, v in parse_id_text(combined + "\n" + ocr_text).items() if v})
     if parsed.get("nationality"):
         parsed["nationality"] = normalise_nationality(parsed["nationality"], parsed.get("nric", ""))
     return parsed
@@ -290,6 +294,102 @@ def title_name_from_email(email: str) -> str:
     name = email.split("@")[0].replace(".", " ").replace("_", " ").strip()
     return name.upper() if name else ""
 
+
+
+
+def _clean_name_candidate(raw: str, client_name: str = "") -> str:
+    """Normalise and validate a likely human adviser name extracted from BI/TFP text."""
+    val = clean(raw)
+    if not val:
+        return ""
+    # Join BI line-broken names such as CHUA LYE KIAT (CAI LAIJI) / IVAN.
+    parts = []
+    for line in val.splitlines():
+        line = clean(line)
+        if not line:
+            continue
+        if re.fullmatch(r"(?i)(date|signature|page \d+ of \d+|this illustration.*|financial consultant'?s name|financial consultant'?s code|your fa representative\(s\)|specially for:?|specially prepared for:?)", line):
+            continue
+        parts.append(line)
+    val = clean(" ".join(parts))
+    val = re.sub(r"^(Mr|Mdm|Ms|Mrs|Miss)\s+", "", val, flags=re.I).strip()
+    val = re.sub(r"\s+", " ", val)
+    val = val.strip(" -:,.|/")
+    if not val:
+        return ""
+    val_u = val.upper()
+    bad_fragments = (
+        "DATE GENERATED", "THIS ILLUSTRATION", "PAGE ", "FINANCIAL PLANNER", "TRUSTED ADVICE",
+        "SPECIAL DISCLOSURE", "POLICY", "PREMIUM", "SUM INSURED", "BENEFIT", "CURRENCY",
+        "PROMISELAND", "MASSIVE WEALTH", "GROUP INSURANCE", "STEP 1", "UPLOAD", "NO FILE",
+        "MWM ADMIN", "MWM PR", "MWM CREATIVE", "ADMIN", "TEST",
+    )
+    if any(x in val_u for x in bad_fragments):
+        return ""
+    if "@" in val or re.search(r"\d{4,}", val):
+        return ""
+    # Must look like a real person name: letters, spaces and common name punctuation only.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z \-().,'/]{2,90}", val):
+        return ""
+    # Avoid copying the client name into the adviser name field.
+    c = clean(client_name).upper()
+    if c and (val_u == c or val_u in c or c in val_u):
+        return ""
+    # Require at least two name tokens except for rare long single-token names.
+    alpha_tokens = re.findall(r"[A-Za-z]+", val)
+    if len(alpha_tokens) < 2 and len(val) < 10:
+        return ""
+    return val
+
+
+def useful_name_from_email(email: str) -> str:
+    """Last-resort email fallback. Do not turn generic team emails into fake adviser names."""
+    local = clean(email.split("@")[0] if email else "").lower()
+    if not local:
+        return ""
+    generic = {"admin", "mwm", "mwm.admin", "mwm.pr", "mwm.creative", "creative", "support", "ops", "operations"}
+    if local in generic or local.startswith("mwm.") or "admin" in local:
+        return ""
+    return title_name_from_email(email)
+
+
+def extract_adviser_name_from_text(text: str, client_name: str = "") -> str:
+    """Extract FA representative name from BI / completed TFP text before using email fallback."""
+    txt = clean(text)
+    if not txt:
+        return ""
+    candidates: list[str] = []
+
+    # Manulife BI signature block near page 1:
+    # <client name> / Date / <adviser name> / Date / This illustration...
+    for m in re.finditer(r"\n\s*Date\s*\n\s*([A-Z][A-Z \n().,'/-]{3,140}?)\n\s*Date\s*\n\s*This illustration", txt, flags=re.I | re.S):
+        candidates.append(m.group(1))
+
+    # Completed TFP cover page after the applicability paragraph usually gives:
+    # client name / FA name / STEP 1.
+    m = re.search(r"Group Insurance\.\s*\n\s*([^\n]{2,90})\s*\n\s*([^\n]{2,90})\s*\n\s*(?:STEP\s*1|Step\s*1)", txt, flags=re.I)
+    if m:
+        # Use the second line as FA name. The first line is client name.
+        candidates.append(m.group(2))
+
+    # Some PDF text renderers keep the label before the filled value.
+    for pat in (
+        r"Your FA Representative\(s\)\s*\n\s*([^\n]{2,90})",
+        r"Financial Consultant'?s name\s*\n\s*([^\n]{2,90})",
+        r"FA Rep.?s Name\s*\n(?:[^\n]*\n){0,8}?\s*([A-Z][A-Z \-().']{3,90})\s*\n\s*(?:[A-Z0-9]{4,12}|\d{1,2}\s+[A-Z]{3})",
+    ):
+        for m in re.finditer(pat, txt, flags=re.I):
+            candidates.append(m.group(1))
+
+    # Email trail / ID verification often says "by Ivan Chua Lye Kiat".
+    for m in re.finditer(r"Sighted and verified\s+by\s+([A-Z][A-Za-z \-().']{3,90})", txt, flags=re.I):
+        candidates.append(m.group(1))
+
+    for cand in candidates:
+        cleaned = _clean_name_candidate(cand, client_name)
+        if cleaned:
+            return cleaned
+    return ""
 
 def split_client_name(name: str) -> tuple[str, str]:
     parts = clean(name).split()
@@ -408,10 +508,15 @@ def extract_from_bi(text: str, fields: dict[str, str]) -> dict[str, Any]:
     data["age_last_birthday"] = clean(find(r"Age Last Birthday\s*:\s*(\d+)", text))
     data["policy_term"] = clean(find(r"Manulife InvestReady[^\n]*\s+(Up to age 99)\s+(\d+)\s+", text)) or "Up to 99 years"
     data["premium_term"] = clean(find(r"Manulife InvestReady[^\n]*Up to age 99\s+(\d+)\s+", text))
-    fa_match = re.search(r"\nDate\s*\n([A-Z][A-Z \n().,'/-]{3,80}?)\nDate\s*\nThis illustration", text, flags=re.S)
+    fa_match = re.search(r"\nDate\s*\n([A-Z][A-Z \n().,'/-]{3,120}?)\nDate\s*\nThis illustration", text, flags=re.S)
     if fa_match:
         fa = clean(" ".join(line.strip() for line in fa_match.group(1).splitlines() if line.strip()))
-        if fa and not re.search(r"^(MR|MDM|MS|MRS)\b", fa, re.I):
+        fa = _clean_name_candidate(fa, data.get("client_name", ""))
+        if fa:
+            data["adviser_name_from_bi"] = fa
+    if not data.get("adviser_name_from_bi"):
+        fa = extract_adviser_name_from_text(text, data.get("client_name", ""))
+        if fa:
             data["adviser_name_from_bi"] = fa
     # Common known HSBC / FWD plan text fallbacks
     if re.search(r"HSBC Life Indexed Flexi Income", text, re.I) and not data.get("plan_name"):
@@ -460,7 +565,12 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "") -
         if not data.get("age_next") and data.get("dob"):
             data["age_next"] = age_next_birthday(data["dob"])
     data["adviser_email"] = adviser_email
-    data["adviser_name"] = data.get("adviser_name_from_bi") or data.get("adviser_name_from_hsbc") or first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
+    adviser_from_fields = _clean_name_candidate(first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa"), data.get("client_name", ""))
+    adviser_from_text = extract_adviser_name_from_text(text, data.get("client_name", ""))
+    # Do NOT derive FA representative name from adviser email.
+    # Adviser email is only used for contact/login/reference, never for filling FA name.
+    # If BI/extracted text does not provide a valid adviser name, leave this blank instead of using MWM ADMIN / email local-part.
+    data["adviser_name"] = data.get("adviser_name_from_bi") or data.get("adviser_name_from_hsbc") or adviser_from_text or adviser_from_fields or ""
     data["fa_source_code"] = first_field(fields, "sourcecode", "Representatives Code 1")
     # Fund allocation if found in Manulife application.
     data["fund_code"] = first_field(fields, "Fund CodeRow1")
