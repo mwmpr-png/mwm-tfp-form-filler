@@ -39,91 +39,82 @@ def set_need_appearances(writer: PdfWriter) -> None:
         pass
 
 
-def _fitz_font_size(value: str, rect) -> float:
-    """Choose a conservative font size so filled PDF fields remain editable and readable."""
-    value = str(value or "")
-    w = max(float(rect.x1 - rect.x0), 1.0)
-    h = max(float(rect.y1 - rect.y0), 1.0)
-    n = max(len(value), 1)
-    if h > 120:
-        return 6.2
-    if n > 250:
-        return 5.8
-    if n > 120:
-        return 6.3
-    if h <= 14:
-        return max(5.0, min(7.0, w / n * 1.25))
-    if h <= 20:
-        return max(6.0, min(8.0, w / n * 1.45))
-    if n > 60:
-        return 7.0
-    return 8.0
-
-
-def _checkbox_on_value(widget) -> str:
+def _widget_checkbox_on_state(widget) -> str:
     try:
         states = widget.button_states() or {}
         normal = states.get("normal") or []
-        for val in normal:
-            if val and str(val).lower() != "off":
-                return str(val)
+        for state in normal:
+            if str(state).lstrip("/").lower() != "off":
+                return str(state).lstrip("/")
     except Exception:
         pass
     return "On"
 
 
-def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None, clear_existing: bool = False) -> Path:
-    """Fill the AcroForm using PyMuPDF widget appearances.
+def _fit_widget_font_size(widget, value: str) -> float | None:
+    """Choose a conservative font size while keeping the field itself editable."""
+    try:
+        rect = widget.rect
+        width = max(rect.width, 1.0)
+        height = max(rect.height, 1.0)
+        value = str(value or "")
+        if not value:
+            return None
+        multiline = bool(widget.field_flags & 4096)
+        current = float(widget.text_fontsize or 0)
+        if multiline:
+            # Approximate characters that fit at a given size; preserve line breaks.
+            fs = current if current > 0 else 8.0
+            fs = min(fs, 8.0)
+            while fs > 5.2:
+                chars_per_line = max(int(width / (fs * 0.52)), 10)
+                lines_available = max(int(height / (fs * 1.25)), 1)
+                explicit_lines = sum(max(1, (len(line) + chars_per_line - 1) // chars_per_line) for line in value.splitlines() or [value])
+                if explicit_lines <= lines_available:
+                    break
+                fs -= 0.3
+            return max(fs, 5.2)
+        fs = current if current > 0 else min(10.0, height * 0.62)
+        if len(value) > 1:
+            fs = min(fs, max(5.5, width / (len(value) * 0.55)))
+        return max(5.5, min(fs, 10.0))
+    except Exception:
+        return None
 
-    This keeps the PDF fields editable. Earlier versions stamped a visible text overlay
-    above some fields, which made edits look duplicated/wonky in browser PDF viewers.
-    """
-    checkbox_values = checkbox_values or {}
-    text_values = {str(k): str(v) for k, v in field_values.items() if v is not None and str(v) != ""}
-    check_values = {str(k): str(v) for k, v in checkbox_values.items() if v is not None and str(v) not in ("", "Off", "/Off")}
-    all_names = set(text_values) | set(check_values)
 
+def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None) -> Path:
+    """Fill AcroForm widgets with regenerated appearance streams while preserving editability."""
     output.parent.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(str(template))
-    for page in doc:
-        widgets = list(page.widgets() or [])
-        for widget in widgets:
-            name = widget.field_name
-            if not name:
-                continue
-            try:
-                if clear_existing:
-                    # This is required when a previously completed PDF is used as a clean fillable template.
-                    # We clear every widget first so old client data cannot remain in untouched fields.
-                    if widget.field_type_string in ("CheckBox", "RadioButton"):
-                        widget.field_value = False
-                    else:
-                        widget.field_value = ""
-                    widget.update()
-                if name not in all_names:
-                    continue
-                if name in check_values or widget.field_type_string in ("CheckBox", "RadioButton"):
-                    if name in check_values:
-                        widget.field_value = _checkbox_on_value(widget)
+    shutil.copyfile(template, output)
+    checkbox_values = checkbox_values or {}
+    text_values = {k: str(v) for k, v in field_values.items() if v not in (None, "")}
+    checkbox_names = {k for k, v in checkbox_values.items() if v not in (None, "", "Off", "/Off")}
+
+    doc = fitz.open(str(output))
+    try:
+        for page in doc:
+            widget = page.first_widget
+            while widget:
+                name = widget.field_name or ""
+                try:
+                    if name in checkbox_names and widget.field_type in (2, 5):
+                        widget.field_value = _widget_checkbox_on_state(widget)
                         widget.update()
-                else:
-                    value = text_values.get(name, "")
-                    widget.field_value = value
-                    try:
-                        widget.text_font = "Helv"
-                    except Exception:
-                        pass
-                    try:
-                        widget.text_fontsize = _fitz_font_size(value, widget.rect)
-                    except Exception:
-                        pass
-                    widget.update()
-            except Exception:
-                # Continue filling other fields even if an individual widget has an issue.
-                continue
-    doc.save(str(output), garbage=4, deflate=True)
-    doc.close()
+                    elif name in text_values and widget.field_type not in (2, 5, 6):
+                        value = text_values[name]
+                        widget.field_value = value
+                        fs = _fit_widget_font_size(widget, value)
+                        if fs:
+                            widget.text_fontsize = fs
+                        widget.update()
+                except Exception:
+                    pass
+                widget = widget.next
+        doc.saveIncr()
+    finally:
+        doc.close()
     return output
+
 
 def _field_widgets(template: Path):
     try:
@@ -278,8 +269,12 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     cpf_total = money_number(data.get("cpf_total", ""))
     total_assets = cpf_total + money_number(data.get("other_assets", ""))
     retirement = data.get("expected_retirement_income", "")
-    plan = data.get("plan_name") or ("Manulife InvestReady (III)" if product_type == "Manulife" else ("HSBC Life Indexed Flexi Income" if product_type == "HSBC" else "FWD Invest Flexi Elite"))
-    insurer = "Manulife" if product_type == "Manulife" else ("HSBC Life" if product_type == "HSBC" else "FWD")
+    plan = data.get("plan_name") or ({
+        "Manulife": "Manulife InvestReady (III)",
+        "FWD": "FWD Invest Flexi Elite",
+        "Tokio Marine": "Tokio Marine investment-linked plan",
+    }.get(product_type, product_type))
+    insurer = {"Manulife": "Manulife", "FWD": "FWD", "Tokio Marine": "Tokio Marine"}.get(product_type, product_type)
     fund_name = data.get("fund_name", "")
     fund_code = data.get("fund_code", "")
     today = today_ddmmyyyy()
@@ -292,9 +287,9 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "NRIC": nric,
         "NRICS": "",
         # personal particulars
-        "undefined_2": data.get("nationality", ""),
+        "undefined_2": data.get("nationality", "SINGAPORE CITIZEN"),
         "Date of Birth  GG PPP": data.get("dob", ""),
-        "undefined_4": data.get("birthplace", ""),
+        "undefined_4": data.get("birthplace", "SINGAPORE"),
         "Age Next Birthday ANB": data.get("age_next", ""),
         "Residential Address": data.get("residential_address", ""),
         "Postal Code": data.get("postal", ""),
@@ -334,8 +329,8 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "fill_23": fmt_money(money_number(premium), compact=True) + ("/YEAR" if premium else ""),
         "UT 1": "ILP",
         "RSP 1": "100%" if fund_name else "",
-        "Name of Fund Manager  Investment Product1": fund_name or ("Selected index account(s)" if product_type == "HSBC" else ("Selected ILP fund(s)" if product_type == "FWD" else "")),
-        "Asset Class": "B" if product_type == "Manulife" else ("M" if product_type == "HSBC" else "MIXED"),
+        "Name of Fund Manager  Investment Product1": fund_name or ("Selected ILP fund(s)" if product_type == "FWD" else ""),
+        "Asset Class": "B" if product_type == "Manulife" else "MIXED",
         "Text37": "Saving and investing to achieve capital gains and potentially higher returns.",
         "Text38": "Up to 99 years" if product_type == "Manulife" else "Till Age 100",
         "Text39": f"{plan} is an investment-linked plan designed to provide investment opportunities with insurance coverage and flexibility to meet changing financial needs.",
@@ -443,6 +438,140 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "Check Box148": "Check Box148",
         "Check Box149": "Check Box149",
     }
+    if product_type == "Tokio Marine":
+        case_date = data.get("case_date", "") or today
+        try:
+            d, m, y = case_date.split("/")
+            case_date_us = f"{int(m):02d}/{int(d):02d}/{y}"
+        except Exception:
+            case_date_us = case_date
+
+        # Replace generic / inferred values with Tokio source-derived values only.
+        expenses = money_number(data.get("cashflow_expenses", ""))
+        total_assets_tm = money_number(data.get("total_assets", ""))
+        net_assets_tm = money_number(data.get("net_assets", ""))
+        if not net_assets_tm and total_assets_tm:
+            net_assets_tm = total_assets_tm - money_number(data.get("total_liabilities", ""))
+
+        fields.update({
+            "if retired  unemployed": "",
+            # The blank TFP already prints the standard suggested assumptions.
+            # Leave the client-preferred assumption fields blank unless a source
+            # document explicitly supplies them.
+            "Text3000": "",
+            "Text3111": "",
+            "Text3222": "",
+            "Text322": "",
+            "Text119": fmt_money(income_n) if income_n else "",
+            "Text25": fmt_money(expenses) if expenses else "",
+            "Text27": fmt_money(max(income_n - expenses, 0)) if (income_n and expenses) else "",
+            "Text118": data.get("assets_reason", ""),
+            "Text121": "",
+            "Text123": norm_money(data.get("investment_assets", "")),
+            "Text125": norm_money(data.get("cpf_total", "")),
+            "Text127": norm_money(data.get("cash_assets", "")),
+            "Text129": norm_money(data.get("total_assets", "")),
+            "Text131": "",
+            "Text133": "",
+            "Text135": norm_money(data.get("total_liabilities", "")),
+            "Text137": norm_money(data.get("net_assets", "")),
+            "Text150": (fmt_money(money_number(premium)) + "/year") if premium else "",
+            "Text152": data.get("source_of_funds", ""),
+            "fill_27": fmt_money(money_number(data.get("retirement_amt", ""))) if data.get("retirement_amt") else "",
+            "fill_29": fmt_money(money_number(data.get("retirement_income", ""))) if data.get("retirement_income") else "",
+            "fill_311": fmt_money(money_number(data.get("retirement_shortfall", ""))) if data.get("retirement_shortfall") else "",
+            "fill_33": fmt_money(money_number(data.get("retirement_total_amt", ""))) if data.get("retirement_total_amt") else "",
+            "fill_37": fmt_money(money_number(data.get("retirement_amt_plan", ""))) if data.get("retirement_amt_plan") else "",
+            "S  L  JO": data.get("risk_profile", ""),
+            "Name of Products": plan,
+            "Company1": "Tokio Marine",
+            "fill_23": (fmt_money(money_number(premium)) + "/year") if premium else "",
+            "Text37": "A long-term investment-linked plan for wealth accumulation with insurance protection.",
+            "Text38": data.get("policy_term", "") or "Life",
+            "Text39": f"A regular premium investment-linked plan with {data.get('benefit_type', 'the selected')} death benefit option and a {data.get('mip', '')} minimum investment period.".replace("  ", " ").strip(),
+            "Text40": "For the Enhanced Death Benefit option, during the minimum investment period the death benefit is the higher of 101% of non-guaranteed policy value or the guaranteed death benefit based on regular premiums paid; thereafter it is 101% of non-guaranteed policy value." if str(data.get("benefit_type", "")).lower() == "enhanced" else "Investment-linked benefits and account values are subject to the policy terms and are not guaranteed.",
+            "5 Clients Risk Profile": data.get("risk_profile", ""),
+            "6 Clients Expected Rate of Return": data.get("expected_return", ""),
+            "7 Sales Charges  WRAP  Platform Fee": data.get("sales_charges", ""),
+            "8 The Nature of Product  Investment Risk": data.get("investment_risk", "") or data.get("risk_profile", ""),
+            "Text41": "Capital and investment returns are not guaranteed. Actual benefits depend on fund performance, fees and charges, withdrawals and policy alterations; past performance is not indicative of future performance.",
+            "Date21_af_client_2": case_date_us,
+            "Date166_af_date": case_date_us,
+            "Date167_af_date": case_date_us,
+        })
+
+        # Clear generic single-fund row, then fill all Tokio funds from the application / BI.
+        for i in range(1, 8):
+            fields[f"UT {i}"] = ""
+            fields[f"RSP {i}"] = ""
+            fields[f"Name of Fund Manager  Investment Product{i}"] = ""
+            fields["Asset Class" if i == 1 else f"Asset Class_{i}"] = ""
+            fname = data.get(f"fund_{i}_name", "")
+            if fname:
+                fields[f"UT {i}"] = "ILP"
+                fields[f"Name of Fund Manager  Investment Product{i}"] = fname
+                amount = data.get(f"fund_{i}_amount", "")
+                fields[f"RSP {i}"] = (norm_money(amount) + "/year") if amount else ""
+                fields["Asset Class" if i == 1 else f"Asset Class_{i}"] = data.get(f"fund_{i}_asset_class", "")
+
+        # Match the approved Tokio Marine FA declaration categories supplied as the reference.
+        cb.pop("Group Insurance", None)
+        cb.pop("General Insurance", None)
+
+        # Client-specific answers must not be invented from the insurer alone.
+        for unknown_cb in [
+            "no3", "yes1",
+            "Check Box1003", "Check Box1012", "Check Box1020", "Check Box1025", "Check Box1034", "Check Box1045", "Check Box1077", "Check Box1085",
+            "Check Box33", "No Existing ILPCIS PolicyPortfolio1", "n4", "1R_4", "N11", "1R_2",
+            "Check Box37", "Check Box433", "No3", "No4", "No5", "No6", "No7", "Check Box5", "Yes10",
+            "Existing Client", "Video conferencing", "Video conferencing_2", "Non Face to Face",
+            "Check Box42", "Check Box43", "Check Box48", "Check Box63", "Savings", "Check Box67", "Check Box72", "Check Box76", "Check Box80",
+            "Text messagesSMS", "Check Box7_1", "Check Box99", "Check Box94", "Check Box95", "Check Box101", "Check Box103", "Check Box96", "Check Box97", "Check Box105", "Check Box98", "Check Box107", "Check Box110", "Check Box111", "Check Box113", "Check Box114", "Check Box116", "Check Box118", "Check Box117", "Check Box119", "Check Box122", "Check Box123", "Check Box126", "Check Box127", "Check Box130", "Check Box131", "Check Box133", "Check Box136", "Check Box134", "Check Box137", "Check Box135", "Check Box138", "Check Box146", "Check Box145", "Check Box84", "Check Box85", "Check Box148", "Check Box149",
+        ]:
+            cb.pop(unknown_cb, None)
+
+        # Smoker status is explicit in the Tokio BI.
+        cb.pop("No", None)
+        if str(data.get("smoker", "")).lower() == "no":
+            cb["No"] = "On"
+        elif str(data.get("smoker", "")).lower() == "yes":
+            cb["Yes"] = "On"
+
+        # Income bracket can be determined directly from the application income.
+        for income_cb in ("Check Box1", "Check Box2", "Check Box3", "Check Box4", "Check Box6", "Check Box12"):
+            cb.pop(income_cb, None)
+        if income_n:
+            if income_n < 30000: cb["Check Box1"] = "On"
+            elif income_n <= 50000: cb["Check Box3"] = "On"
+            elif income_n <= 100000: cb["Check Box6"] = "On"
+            elif income_n <= 150000: cb["Check Box2"] = "On"
+            elif income_n <= 250000: cb["Check Box4"] = "On"
+            else: cb["Check Box12"] = "On"
+
+        # Cash flow is included when an annual income was actually extracted.
+        if income_n:
+            cb["HV"] = "On"
+        else:
+            cb.pop("HV", None)
+
+        # If a supporting TFP explicitly supplies risk profile, reproduce the corresponding risk preference.
+        risk = str(data.get("risk_profile", "")).strip().lower()
+        if risk == "aggressive":
+            cb["Check Box37"] = "Yes"   # high risk-return preference
+            cb["Check Box433"] = "Yes"  # high risk-taking preference
+
+        # Do not claim existing insurance status unless explicitly present in the Tokio application text / supporting document.
+        if str(data.get("existing_policy_status", "")).lower() == "no":
+            cb["No Existing Insurance Policy with"] = "On"
+        else:
+            cb.pop("No Existing Insurance Policy with", None)
+
+        # If disclosed assets are available, determine whether the annual budget exceeds 50% of assets.
+        if total_assets_tm:
+            cb["1R_4"] = "On"
+            if premium and money_number(premium) <= total_assets_tm * 0.5:
+                cb["N11"] = "On"
+
     # Remove Off values so existing blank doesn't get set weirdly.
     cb = {k: v for k, v in cb.items() if v != "Off"}
     return fields, cb
