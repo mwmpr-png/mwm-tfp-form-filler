@@ -39,82 +39,91 @@ def set_need_appearances(writer: PdfWriter) -> None:
         pass
 
 
-def _widget_checkbox_on_state(widget) -> str:
+def _fitz_font_size(value: str, rect) -> float:
+    """Choose a conservative font size so filled PDF fields remain editable and readable."""
+    value = str(value or "")
+    w = max(float(rect.x1 - rect.x0), 1.0)
+    h = max(float(rect.y1 - rect.y0), 1.0)
+    n = max(len(value), 1)
+    if h > 120:
+        return 6.2
+    if n > 250:
+        return 5.8
+    if n > 120:
+        return 6.3
+    if h <= 14:
+        return max(5.0, min(7.0, w / n * 1.25))
+    if h <= 20:
+        return max(6.0, min(8.0, w / n * 1.45))
+    if n > 60:
+        return 7.0
+    return 8.0
+
+
+def _checkbox_on_value(widget) -> str:
     try:
         states = widget.button_states() or {}
         normal = states.get("normal") or []
-        for state in normal:
-            if str(state).lstrip("/").lower() != "off":
-                return str(state).lstrip("/")
+        for val in normal:
+            if val and str(val).lower() != "off":
+                return str(val)
     except Exception:
         pass
     return "On"
 
 
-def _fit_widget_font_size(widget, value: str) -> float | None:
-    """Choose a conservative font size while keeping the field itself editable."""
-    try:
-        rect = widget.rect
-        width = max(rect.width, 1.0)
-        height = max(rect.height, 1.0)
-        value = str(value or "")
-        if not value:
-            return None
-        multiline = bool(widget.field_flags & 4096)
-        current = float(widget.text_fontsize or 0)
-        if multiline:
-            # Approximate characters that fit at a given size; preserve line breaks.
-            fs = current if current > 0 else 8.0
-            fs = min(fs, 8.0)
-            while fs > 5.2:
-                chars_per_line = max(int(width / (fs * 0.52)), 10)
-                lines_available = max(int(height / (fs * 1.25)), 1)
-                explicit_lines = sum(max(1, (len(line) + chars_per_line - 1) // chars_per_line) for line in value.splitlines() or [value])
-                if explicit_lines <= lines_available:
-                    break
-                fs -= 0.3
-            return max(fs, 5.2)
-        fs = current if current > 0 else min(10.0, height * 0.62)
-        if len(value) > 1:
-            fs = min(fs, max(5.5, width / (len(value) * 0.55)))
-        return max(5.5, min(fs, 10.0))
-    except Exception:
-        return None
+def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None, clear_existing: bool = False) -> Path:
+    """Fill the AcroForm using PyMuPDF widget appearances.
 
-
-def fill_pdf(template: Path, output: Path, field_values: dict[str, Any], checkbox_values: dict[str, str] | None = None) -> Path:
-    """Fill AcroForm widgets with regenerated appearance streams while preserving editability."""
-    output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(template, output)
+    This keeps the PDF fields editable. Earlier versions stamped a visible text overlay
+    above some fields, which made edits look duplicated/wonky in browser PDF viewers.
+    """
     checkbox_values = checkbox_values or {}
-    text_values = {k: str(v) for k, v in field_values.items() if v not in (None, "")}
-    checkbox_names = {k for k, v in checkbox_values.items() if v not in (None, "", "Off", "/Off")}
+    text_values = {str(k): str(v) for k, v in field_values.items() if v is not None and str(v) != ""}
+    check_values = {str(k): str(v) for k, v in checkbox_values.items() if v is not None and str(v) not in ("", "Off", "/Off")}
+    all_names = set(text_values) | set(check_values)
 
-    doc = fitz.open(str(output))
-    try:
-        for page in doc:
-            widget = page.first_widget
-            while widget:
-                name = widget.field_name or ""
-                try:
-                    if name in checkbox_names and widget.field_type in (2, 5):
-                        widget.field_value = _widget_checkbox_on_state(widget)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(str(template))
+    for page in doc:
+        widgets = list(page.widgets() or [])
+        for widget in widgets:
+            name = widget.field_name
+            if not name:
+                continue
+            try:
+                if clear_existing:
+                    # This is required when a previously completed PDF is used as a clean fillable template.
+                    # We clear every widget first so old client data cannot remain in untouched fields.
+                    if widget.field_type_string in ("CheckBox", "RadioButton"):
+                        widget.field_value = False
+                    else:
+                        widget.field_value = ""
+                    widget.update()
+                if name not in all_names:
+                    continue
+                if name in check_values or widget.field_type_string in ("CheckBox", "RadioButton"):
+                    if name in check_values:
+                        widget.field_value = _checkbox_on_value(widget)
                         widget.update()
-                    elif name in text_values and widget.field_type not in (2, 5, 6):
-                        value = text_values[name]
-                        widget.field_value = value
-                        fs = _fit_widget_font_size(widget, value)
-                        if fs:
-                            widget.text_fontsize = fs
-                        widget.update()
-                except Exception:
-                    pass
-                widget = widget.next
-        doc.saveIncr()
-    finally:
-        doc.close()
+                else:
+                    value = text_values.get(name, "")
+                    widget.field_value = value
+                    try:
+                        widget.text_font = "Helv"
+                    except Exception:
+                        pass
+                    try:
+                        widget.text_fontsize = _fitz_font_size(value, widget.rect)
+                    except Exception:
+                        pass
+                    widget.update()
+            except Exception:
+                # Continue filling other fields even if an individual widget has an issue.
+                continue
+    doc.save(str(output), garbage=4, deflate=True)
+    doc.close()
     return output
-
 
 def _field_widgets(template: Path):
     try:
@@ -272,9 +281,10 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     plan = data.get("plan_name") or ({
         "Manulife": "Manulife InvestReady (III)",
         "FWD": "FWD Invest Flexi Elite",
+        "HSBC": "HSBC Life Indexed Flexi Income",
         "Tokio Marine": "Tokio Marine investment-linked plan",
     }.get(product_type, product_type))
-    insurer = {"Manulife": "Manulife", "FWD": "FWD", "Tokio Marine": "Tokio Marine"}.get(product_type, product_type)
+    insurer = {"Manulife": "Manulife", "FWD": "FWD", "HSBC": "HSBC Life", "Tokio Marine": "Tokio Marine"}.get(product_type, product_type)
     fund_name = data.get("fund_name", "")
     fund_code = data.get("fund_code", "")
     today = today_ddmmyyyy()
@@ -287,9 +297,9 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "NRIC": nric,
         "NRICS": "",
         # personal particulars
-        "undefined_2": data.get("nationality", "SINGAPORE CITIZEN"),
+        "undefined_2": data.get("nationality", ""),
         "Date of Birth  GG PPP": data.get("dob", ""),
-        "undefined_4": data.get("birthplace", "SINGAPORE"),
+        "undefined_4": data.get("birthplace", ""),
         "Age Next Birthday ANB": data.get("age_next", ""),
         "Residential Address": data.get("residential_address", ""),
         "Postal Code": data.get("postal", ""),
@@ -329,8 +339,8 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "fill_23": fmt_money(money_number(premium), compact=True) + ("/YEAR" if premium else ""),
         "UT 1": "ILP",
         "RSP 1": "100%" if fund_name else "",
-        "Name of Fund Manager  Investment Product1": fund_name or ("Selected ILP fund(s)" if product_type == "FWD" else ""),
-        "Asset Class": "B" if product_type == "Manulife" else "MIXED",
+        "Name of Fund Manager  Investment Product1": fund_name or ("Selected index account(s)" if product_type == "HSBC" else ("Selected ILP fund(s)" if product_type == "FWD" else "")),
+        "Asset Class": "B" if product_type == "Manulife" else ("M" if product_type == "HSBC" else "MIXED"),
         "Text37": "Saving and investing to achieve capital gains and potentially higher returns.",
         "Text38": "Up to 99 years" if product_type == "Manulife" else "Till Age 100",
         "Text39": f"{plan} is an investment-linked plan designed to provide investment opportunities with insurance coverage and flexibility to meet changing financial needs.",
