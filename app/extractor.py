@@ -103,6 +103,181 @@ def all_text_and_fields(paths: list[Path]) -> tuple[str, dict[str, str]]:
     return clean("\n\n".join(texts)), merged_fields
 
 
+
+
+def normalise_nric_from_text(text: str) -> str:
+    """Extract Singapore NRIC/FIN-like value from noisy OCR text."""
+    raw = clean(text).upper().replace("§", "S").replace("＄", "S")
+    # Remove separators but preserve contiguous alphanumeric sequences.
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+    m = re.search(r"([STFG]\d{7}[A-Z])", compact)
+    return m.group(1) if m else ""
+
+
+def normalise_nationality(raw: str, nric: str = "") -> str:
+    val = clean(raw).upper()
+    if not val:
+        return ""
+    if "SINGAPORE CITIZEN" in val or val == "SINGAPOREAN":
+        return "SINGAPORE CITIZEN"
+    if "SINGAPORE PR" in val or "PERMANENT RESIDENT" in val:
+        return "SINGAPORE PR"
+    # Singapore NRIC with non-Singapore nationality normally indicates PR status for the TFP field.
+    if nric and nric[0] in "ST" and val not in ("SINGAPORE", "SINGAPORE CITIZEN"):
+        return "SINGAPORE PR"
+    return val.title() if val.isupper() else raw
+
+
+def parse_id_text(text: str) -> dict[str, str]:
+    text = clean(text)
+    out: dict[str, str] = {}
+    nric = normalise_nric_from_text(text)
+    if nric:
+        out["nric"] = nric
+    name = find(r"(?:^|\n)\s*(?:NAME|Name)\s*\n\s*([A-Z][A-Z\s,.'\-()/]+?)(?:\n|NRIC|DATE OF BIRTH|NATIONALITY)", text, flags=re.I | re.S)
+    if name:
+        name = re.sub(r"\s+", " ", name).strip(" -,/()")
+        if 2 <= len(name) <= 80:
+            out["client_name"] = name.title() if name.isupper() else name
+    dob = find(r"(?:DATE OF BIRTH|Date of Birth|DOB)\s*[:\n ]+([0-9]{1,2}[\-/ ][0-9A-Za-z]{1,9}[\-/ ][0-9]{2,4})", text)
+    if dob:
+        out["dob"] = parse_date_ddmmyyyy(dob)
+    gender = find(r"(?:SEX|Gender)\s*[:\n ]+(MALE|FEMALE|M|F)\b", text)
+    if gender:
+        out["gender"] = "Female" if gender.upper().startswith("F") else "Male"
+    nat = find(r"(?:NATIONALITY\s*/\s*CITIZENSHIP|NATIONALITY|CITIZENSHIP)\s*[:\n ]+([A-Z ]{3,40})", text)
+    if nat:
+        out["nationality"] = normalise_nationality(nat, nric)
+    pob = find(r"(?:PLACE OF BIRTH|Country/Place of birth|Country of Birth)\s*[:\n ]+([A-Z ]{3,40})", text)
+    if pob:
+        out["birthplace"] = clean(pob).title() if pob.isupper() else clean(pob)
+    addr = find(r"(?:ADDRESS|Address)\s*[:\n ]+(.{5,160}?SINGAPORE\s*\d{6})", text)
+    if addr:
+        addr = re.sub(r"\s+", " ", addr).strip()
+        out["residential_address"] = addr.upper()
+        pc = find(r"SINGAPORE\s*(\d{6})", addr)
+        if pc:
+            out["postal"] = pc
+    return {k: clean(v) for k, v in out.items() if clean(v)}
+
+
+def render_first_page_image(path: Path, max_px: int = 1800) -> tuple[str, str] | tuple[None, None]:
+    """Return (mime, base64) for first page / image, downscaled for OpenAI vision."""
+    try:
+        from PIL import Image
+        import io
+        if path.suffix.lower() == ".pdf":
+            doc = fitz.open(str(path))
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+            im = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+        else:
+            im = Image.open(path).convert("RGB")
+        im.thumbnail((max_px, max_px))
+        bio = io.BytesIO()
+        im.save(bio, format="JPEG", quality=88)
+        return "image/jpeg", base64.b64encode(bio.getvalue()).decode("ascii")
+    except Exception:
+        return None, None
+
+
+def local_ocr_id(path: Path) -> str:
+    """Best-effort local OCR only when explicitly enabled. Disabled by default on Railway because it can time out."""
+    if os.getenv("ENABLE_LOCAL_OCR", "").lower() not in {"1", "true", "yes"}:
+        return ""
+    try:
+        import pytesseract
+        from PIL import Image, ImageEnhance
+        if path.suffix.lower() == ".pdf":
+            doc = fitz.open(str(path))
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False)
+            base = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+        else:
+            base = Image.open(path).convert("RGB")
+        variants = [base, base.convert("L"), ImageEnhance.Contrast(base.convert("L")).enhance(1.8)]
+        parts = []
+        for im in variants:
+            for psm in (6, 11, 3):
+                try:
+                    txt = pytesseract.image_to_string(im, config=f"--psm {psm}")
+                    if txt and txt not in parts:
+                        parts.append(txt)
+                except Exception:
+                    continue
+        return clean("\n".join(parts))
+    except Exception:
+        return ""
+
+
+def openai_vision_extract_id(path: Path) -> dict[str, str]:
+    """Use OpenAI vision to read NRIC/ID/passport scans when normal PDF text extraction cannot."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {}
+    mime, b64 = render_first_page_image(path)
+    if not b64:
+        return {}
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        model = os.getenv("OPENAI_VISION_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+        prompt = (
+            "Extract the visible details from this Singapore NRIC/ID/passport image. "
+            "Return only JSON with these keys when visible: client_name, nric, dob, gender, "
+            "nationality, birthplace, residential_address, postal. Use exact document text. "
+            "For dob use DD/MM/YYYY. Do not guess unreadable details."
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            max_tokens=600,
+            messages=[{"role":"user","content":[
+                {"type":"text","text":prompt},
+                {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}},
+            ]}],
+        )
+        content = resp.choices[0].message.content or "{}"
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        obj = json.loads(m.group(0) if m else content)
+        out = {k: clean(v) for k, v in obj.items() if clean(v)}
+        if out.get("nric"):
+            out["nric"] = normalise_nric_from_text(out["nric"])
+        if out.get("dob"):
+            out["dob"] = parse_date_ddmmyyyy(out["dob"])
+        if out.get("nationality"):
+            out["nationality"] = normalise_nationality(out["nationality"], out.get("nric", ""))
+        return {k: v for k, v in out.items() if v}
+    except Exception:
+        return {}
+
+
+def extract_id_document(path: Path) -> dict[str, str]:
+    """Extract key personal details from the uploaded Client NRIC / ID file."""
+    if not path:
+        return {}
+    combined = ""
+    if path.suffix.lower() == ".pdf":
+        combined = pdf_text(path, max_pages=1)
+    parsed = parse_id_text(combined)
+    # If normal PDF text extraction misses core fields, use OpenAI vision on the ID itself.
+    # This is faster and more predictable than local OCR on Railway.
+    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("client_name"):
+        vision = openai_vision_extract_id(path)
+        for k, v in vision.items():
+            if v and (k in {"nric", "dob", "gender", "nationality", "birthplace", "residential_address", "postal"} or not parsed.get(k)):
+                parsed[k] = v
+    # Optional fallback only when ENABLE_LOCAL_OCR=1 is set.
+    if not parsed.get("nric") or not parsed.get("dob") or not parsed.get("residential_address"):
+        ocr_text = local_ocr_id(path)
+        if ocr_text:
+            parsed.update({k: v for k, v in parse_id_text(combined + "\n" + ocr_text).items() if v})
+    if parsed.get("nationality"):
+        parsed["nationality"] = normalise_nationality(parsed["nationality"], parsed.get("nric", ""))
+    return parsed
+
 def find(pattern: str, text: str, flags: int = re.I | re.S, default: str = "") -> str:
     m = re.search(pattern, text, flags)
     return clean(m.group(1)) if m else default
@@ -118,6 +293,175 @@ def first_field(fields: dict[str, str], *names: str) -> str:
 def title_name_from_email(email: str) -> str:
     name = email.split("@")[0].replace(".", " ").replace("_", " ").strip()
     return name.upper() if name else ""
+
+
+
+
+def _clean_name_candidate(raw: str, client_name: str = "") -> str:
+    """Normalise and validate a likely human adviser name extracted from BI/TFP text."""
+    val = clean(raw)
+    if not val:
+        return ""
+    # Join BI line-broken names such as CHUA LYE KIAT (CAI LAIJI) / IVAN.
+    parts = []
+    for line in val.splitlines():
+        line = clean(line)
+        if not line:
+            continue
+        if re.fullmatch(r"(?i)(date|signature|page \d+ of \d+|this illustration.*|financial consultant'?s name|financial consultant'?s code|your fa representative\(s\)|specially for:?|specially prepared for:?)", line):
+            continue
+        parts.append(line)
+    val = clean(" ".join(parts))
+    val = re.sub(r"^(Mr|Mdm|Ms|Mrs|Miss)\s+", "", val, flags=re.I).strip()
+    val = re.sub(r"\s+", " ", val)
+    val = val.strip(" -:,.|/")
+    if not val:
+        return ""
+    val_u = val.upper()
+    bad_fragments = (
+        "DATE GENERATED", "THIS ILLUSTRATION", "PAGE ", "FINANCIAL PLANNER", "TRUSTED ADVICE",
+        "SPECIAL DISCLOSURE", "POLICY", "PREMIUM", "SUM INSURED", "BENEFIT", "CURRENCY",
+        "PROMISELAND", "MASSIVE WEALTH", "GROUP INSURANCE", "STEP 1", "UPLOAD", "NO FILE",
+        "MWM ADMIN", "MWM PR", "MWM CREATIVE", "ADMIN", "TEST",
+    )
+    if any(x in val_u for x in bad_fragments):
+        return ""
+    if "@" in val or re.search(r"\d{4,}", val):
+        return ""
+    # Must look like a real person name: letters, spaces and common name punctuation only.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z \-().,'/]{2,90}", val):
+        return ""
+    # Avoid copying the client name into the adviser name field.
+    c = clean(client_name).upper()
+    if c and (val_u == c or val_u in c or c in val_u):
+        return ""
+    # Require at least two name tokens except for rare long single-token names.
+    alpha_tokens = re.findall(r"[A-Za-z]+", val)
+    if len(alpha_tokens) < 2 and len(val) < 10:
+        return ""
+    return val
+
+
+def useful_name_from_email(email: str) -> str:
+    """Last-resort email fallback. Do not turn generic team emails into fake adviser names."""
+    local = clean(email.split("@")[0] if email else "").lower()
+    if not local:
+        return ""
+    generic = {"admin", "mwm", "mwm.admin", "mwm.pr", "mwm.creative", "creative", "support", "ops", "operations"}
+    if local in generic or local.startswith("mwm.") or "admin" in local:
+        return ""
+    return title_name_from_email(email)
+
+
+def extract_adviser_name_from_text(text: str, client_name: str = "") -> str:
+    """Extract FA representative name from BI / completed TFP text before using email fallback."""
+    txt = clean(text)
+    if not txt:
+        return ""
+    candidates: list[str] = []
+
+    # Manulife BI signature block near page 1:
+    # <client name> / Date / <adviser name> / Date / This illustration...
+    for m in re.finditer(r"\n\s*Date\s*\n\s*([A-Z][A-Z \n().,'/-]{3,140}?)\n\s*Date\s*\n\s*This illustration", txt, flags=re.I | re.S):
+        candidates.append(m.group(1))
+
+    # Completed TFP cover page after the applicability paragraph usually gives:
+    # client name / FA name / STEP 1.
+    m = re.search(r"Group Insurance\.\s*\n\s*([^\n]{2,90})\s*\n\s*([^\n]{2,90})\s*\n\s*(?:STEP\s*1|Step\s*1)", txt, flags=re.I)
+    if m:
+        # Use the second line as FA name. The first line is client name.
+        candidates.append(m.group(2))
+
+    # Some PDF text renderers keep the label before the filled value.
+    for pat in (
+        r"Your FA Representative\(s\)\s*\n\s*([^\n]{2,90})",
+        r"Financial Consultant'?s name\s*\n\s*([^\n]{2,90})",
+        r"FA Rep.?s Name\s*\n(?:[^\n]*\n){0,8}?\s*([A-Z][A-Z \-().']{3,90})\s*\n\s*(?:[A-Z0-9]{4,12}|\d{1,2}\s+[A-Z]{3})",
+    ):
+        for m in re.finditer(pat, txt, flags=re.I):
+            candidates.append(m.group(1))
+
+    # Email trail / ID verification often says "by Ivan Chua Lye Kiat".
+    for m in re.finditer(r"Sighted and verified\s+by\s+([A-Z][A-Za-z \-().']{3,90})", txt, flags=re.I):
+        candidates.append(m.group(1))
+
+    for cand in candidates:
+        cleaned = _clean_name_candidate(cand, client_name)
+        if cleaned:
+            return cleaned
+    return ""
+
+def split_client_name(name: str) -> tuple[str, str]:
+    parts = clean(name).split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0].upper(), ""
+    return parts[0].upper(), " ".join(parts[1:]).upper()
+
+
+def extract_hsbc_tfp_personal(text: str) -> dict[str, Any]:
+    """Best-effort extraction from completed HSBC/TFP examples where PDF form fields are absent."""
+    out: dict[str, Any] = {}
+    # Common sequence in completed TFP: name, NRIC, nationality, DOB, birthplace, then gender/smoker/marital rows.
+    m = re.search(r"Name\s*\nNRIC\s*/\s*FIN\s*/\s*Passport No\.\s*\nNationality\s*\nDate of Birth[^\n]*\nPlace of Birth[\s\S]{0,120}?\n\s*([A-Z][A-Za-z ,.'-]{2,80})\s*\n\s*([STFG]\d{7}[A-Z])\s*\n\s*([A-Z ]{3,30})\s*\n\s*(\d{1,2}/\d{1,2}/\d{4})\s*\n\s*([A-Z ]{3,30})", text, flags=re.I)
+    if m:
+        out["client_name"] = clean(m.group(1)).title()
+        out["nric"] = m.group(2).upper()
+        out["nationality"] = normalise_nationality(m.group(3), out["nric"])
+        out["dob"] = parse_date_ddmmyyyy(m.group(4))
+        out["birthplace"] = clean(m.group(5)).title()
+    # Fallback for HSBC GIO text: surname and given name are separated.
+    if not out.get("client_name"):
+        m = re.search(r"Last Name/Surname\s*\n\s*First/Given Name[\s\S]{0,120}?\n\s*([A-Z][A-Z'-]+)\s*\n\s*([A-Z][A-Z\s'-]+)\s*\n", text, flags=re.I)
+        if m:
+            out["client_name"] = clean(m.group(1) + " " + m.group(2)).title()
+    if not out.get("nric"):
+        nric = normalise_nric_from_text(text)
+        if nric:
+            out["nric"] = nric
+    if not out.get("dob"):
+        dob = find(r"Date of birth\s*\(dd/mm/yyyy\)\s*\n\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text)
+        if dob:
+            out["dob"] = parse_date_ddmmyyyy(dob)
+    if not out.get("residential_address"):
+        m = re.search(r"Residential Address[\s\S]{0,420}?\n\s*([A-Z0-9 #,.'/-]+SINGAPORE)\s*\n\s*Postal Code\s*\n\s*(\d{6})", text, flags=re.I)
+        if m:
+            out["residential_address"] = clean(m.group(1)).upper()
+            out["postal"] = m.group(2)
+    if not out.get("mobile"):
+        mob = find(r"Mobile Number\s*\nEmail Address[\s\S]{0,80}?\n\s*([689]\d{7})", text)
+        if mob:
+            out["mobile"] = mob
+    if not out.get("client_email"):
+        email = find(r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", text, flags=re.I)
+        if email:
+            out["client_email"] = email
+    if re.search(r"\bFemale\b|IZl Female|\[Z\]\s*Female|Female\s*\n", text, flags=re.I):
+        out.setdefault("gender", "Female")
+    elif re.search(r"\bMale\b", text, flags=re.I):
+        out.setdefault("gender", "Male")
+    if re.search(r"\bMarried\b", text, flags=re.I):
+        out.setdefault("marital_status", "Married")
+    plan = find(r"I recommend the\s+([^\n]+)", text) or find(r"Product\s*Name\s*[:\n ]+([^\n]+)", text)
+    if plan:
+        out["plan_name"] = clean(plan)
+    if re.search(r"HSBC Life Indexed Flexi Income", text, re.I):
+        out.setdefault("plan_name", "HSBC Life Indexed Flexi Income")
+    if re.search(r"Diamond Prestige|IUL", text, re.I):
+        out.setdefault("plan_name", "HSBC Life Diamond Prestige IUL II")
+    prem = find(r"US\$\s*([0-9,]+(?:\.\d+)?)\s+single premium", text) or find(r"single premium policy\s+using.*?US\$\s*([0-9,]+)", text) or find(r"Premium\s*Amount\s*[:\n ]+\$?([0-9,]+(?:\.\d+)?)", text)
+    if prem:
+        out["premium"] = prem
+        out.setdefault("currency", "USD" if "US$" in text[:max(text.find(prem)+10, 0)] or "USD" in text else "SGD")
+    # Completed HSBC GIO examples often have the consultant name/code visible.
+    fa = find(r"Financial Consultant's name\s*\n\s*([^\n]+)", text)
+    code = find(r"Financial Consultant's code\s*\n\s*([0-9A-Za-z]+)", text)
+    if fa and not re.search(r"Financial Consultant|Organisation", fa, re.I):
+        out["adviser_name_from_hsbc"] = clean(fa)
+    if code:
+        out["fa_source_code"] = code
+    return {k: clean(v) for k, v in out.items() if clean(v)}
 
 
 def parse_date_ddmmyyyy(raw: str) -> str:
@@ -148,7 +492,6 @@ def age_next_birthday(dob: str, ref: date | None = None) -> str:
         return str(age)
     except Exception:
         return ""
-
 
 
 def first_match(patterns: list[str], text: str, flags: int = re.I | re.S) -> str:
@@ -242,6 +585,8 @@ def extract_tokio_marine(text: str, fields: dict[str, str]) -> dict[str, Any]:
         r"Nationality\s*\n?\s*(Singapore|Singaporean|[A-Za-z][A-Za-z ]+?)\s*(?:Passport|Country of Birth)",
         r"Nationality\s*:\s*([^\n]+)",
     ], text)
+    if clean(out.get("nationality", "")).lower() == "singapore":
+        out["nationality"] = "Singaporean"
     out["birthplace"] = first_match([r"Country of Birth\s*\n?\s*([^\n]+)", r"Country/Place of birth\s*\n?\s*([^\n]+)"], text)
     address, postal = _tokio_residential_address(text)
     if address: out["residential_address"] = address
@@ -376,6 +721,7 @@ def extract_tokio_marine(text: str, fields: dict[str, str]) -> dict[str, Any]:
 
     return {k: v for k, v in out.items() if v not in (None, "")}
 
+
 def extract_from_bi(text: str, fields: dict[str, str]) -> dict[str, Any]:
     data: dict[str, Any] = {}
     data["client_name"] = clean(find(r"Specially prepared for\s*:\s*(?:Mr|Mdm|Ms|Mrs)?\s*([^\n]+?)\s+Date Generated", text) or first_field(fields, "Full Name", "Name of Proposer", "Clientname", "client_name"))
@@ -390,9 +736,27 @@ def extract_from_bi(text: str, fields: dict[str, str]) -> dict[str, Any]:
     data["age_last_birthday"] = clean(find(r"Age Last Birthday\s*:\s*(\d+)", text))
     data["policy_term"] = clean(find(r"Manulife InvestReady[^\n]*\s+(Up to age 99)\s+(\d+)\s+", text)) or "Up to 99 years"
     data["premium_term"] = clean(find(r"Manulife InvestReady[^\n]*Up to age 99\s+(\d+)\s+", text))
-    # Common known FWD plan text fallback
+    fa_match = re.search(r"\nDate\s*\n([A-Z][A-Z \n().,'/-]{3,120}?)\nDate\s*\nThis illustration", text, flags=re.S)
+    if fa_match:
+        fa = clean(" ".join(line.strip() for line in fa_match.group(1).splitlines() if line.strip()))
+        fa = _clean_name_candidate(fa, data.get("client_name", ""))
+        if fa:
+            data["adviser_name_from_bi"] = fa
+    if not data.get("adviser_name_from_bi"):
+        fa = extract_adviser_name_from_text(text, data.get("client_name", ""))
+        if fa:
+            data["adviser_name_from_bi"] = fa
+    # Common known HSBC / FWD plan text fallbacks
+    if re.search(r"HSBC Life Indexed Flexi Income", text, re.I) and not data.get("plan_name"):
+        data["plan_name"] = "HSBC Life Indexed Flexi Income"
+    if re.search(r"HSBC Life Diamond Prestige|Diamond Prestige IUL|IUL II", text, re.I) and not data.get("plan_name"):
+        data["plan_name"] = "HSBC Life Diamond Prestige IUL II"
     if re.search(r"FWD|Invest Flexi Elite", text, re.I) and not data.get("plan_name"):
         data["plan_name"] = "FWD Invest Flexi Elite"
+    hsbc_extra = extract_hsbc_tfp_personal(text)
+    for k, v in hsbc_extra.items():
+        if v and not data.get(k):
+            data[k] = v
     return {k: v for k, v in data.items() if v}
 
 
@@ -410,7 +774,9 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "", p
     data["gender"] = data.get("gender") or ("Female" if re.search(r"\bFEMALE\b", text, re.I) else ("Male" if re.search(r"\bMALE\b", text, re.I) else ""))
     data["marital_status"] = "Widowed" if fields.get("Widowed") or fields.get("checkbox_widowed") else ("Married" if fields.get("Married") or fields.get("checkbox_married") else ("Single" if fields.get("Single") or fields.get("checkbox_single") else ""))
     data["residential_address"] = first_field(fields, "Residential Address", "residential_address", "is no residential address in the identification document 1") or find(r"ADDRESS\s*\n?(.+?SINGAPORE\s*\d{6})", text)
-    data["postal"] = first_field(fields, "Postal Code", "postal") or find(r"SINGAPORE\s*(\d{6})", data.get("residential_address", "") or text)
+    data["postal"] = first_field(fields, "Postal Code", "postal")
+    if not data.get("postal") and data.get("residential_address"):
+        data["postal"] = find(r"SINGAPORE\s*(\d{6})", data.get("residential_address", ""))
     data["mobile"] = first_field(fields, "Mobile No", "Mobile Number", "mobile_number", "undefined_7")
     data["client_email"] = first_field(fields, "Email Address", "email", "undefined_8")
     data["occupation"] = first_field(fields, "Occupation", "occupation", "undefined_9")
@@ -427,7 +793,12 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "", p
         if not data.get("age_next") and data.get("dob"):
             data["age_next"] = age_next_birthday(data["dob"])
     data["adviser_email"] = adviser_email
-    data["adviser_name"] = first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa") or title_name_from_email(adviser_email)
+    adviser_from_fields = _clean_name_candidate(first_field(fields, "FAname", "fa_name", "Representatives Name 1", "namefa"), data.get("client_name", ""))
+    adviser_from_text = extract_adviser_name_from_text(text, data.get("client_name", ""))
+    # Do NOT derive FA representative name from adviser email.
+    # Adviser email is only used for contact/login/reference, never for filling FA name.
+    # If BI/extracted text does not provide a valid adviser name, leave this blank instead of using MWM ADMIN / email local-part.
+    data["adviser_name"] = data.get("adviser_name_from_bi") or data.get("adviser_name_from_hsbc") or adviser_from_text or adviser_from_fields or ""
     data["fa_source_code"] = first_field(fields, "sourcecode", "Representatives Code 1")
     # Fund allocation if found in Manulife application.
     data["fund_code"] = first_field(fields, "Fund CodeRow1")
@@ -443,14 +814,13 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "", p
 
     if product_type == "Tokio Marine" or re.search(r"Tokio\s+Marine|Wealth\s+Flexi-Link", text, re.I):
         tm = extract_tokio_marine(text, fields)
-        # Tokio application / BI are authoritative for Tokio-specific client, product and adviser data.
+        # Tokio application / Policy Illustration are authoritative for Tokio-specific
+        # client, product, adviser and fund data.  This is deliberately added on top of
+        # the existing Manulife/FWD/HSBC extraction rather than replacing it.
         for k, v in tm.items():
             if v not in (None, ""):
                 data[k] = v
-        # Do not keep generic keyword guesses from insurer option lists.  Tokio's
-        # proposal contains labels such as "Savings" even when no corresponding
-        # client declaration is selected, so only retain these values when they
-        # were explicitly extracted from a supporting completed TFP.
+        # Avoid turning unselected option labels in the insurer form into a client declaration.
         if not tm.get("source_of_income"):
             data.pop("source_of_income", None)
 
@@ -512,7 +882,7 @@ def recommendation_text(data: dict[str, Any], product_type: str, expected_retire
         if risk:
             parts.append(f"Client risk profile recorded in the supporting documents: {risk}. Any mismatch between the client's risk profile and selected funds should be explained and acknowledged before proceeding.")
         return "\n\n".join(parts)
-    plan = data.get("plan_name") or ("Manulife InvestReady (III) 10 Years Flexi 3" if product_type == "Manulife" else "FWD Invest Flexi Elite")
+    plan = data.get("plan_name") or ("Manulife InvestReady (III) 10 Years Flexi 3" if product_type == "Manulife" else ("HSBC Life Indexed Flexi Income" if product_type == "HSBC" else "FWD Invest Flexi Elite"))
     premium = norm_money(data.get("premium") or "")
     yearly = fmt_money(money_number(expected_retirement_income)) if expected_retirement_income else ""
     cpf = data.get("cpf_total", "")
@@ -530,6 +900,8 @@ def recommendation_text(data: dict[str, Any], product_type: str, expected_retire
     base.append("The client has been informed that returns, dividends and surrender values are not guaranteed. Fund prices may go up or down and past performance is not indicative of future performance.")
     if product_type == "Manulife":
         base.append("For Manulife InvestReady (III) 10 Years Flexi 3, client has the flexibility to pay premiums for the first 3 policy years or continue to contribute thereafter. Client has also been informed that withdrawals or surrender within the first 10 policy years may incur applicable surrender / withdrawal charges.")
+    elif product_type == "HSBC":
+        base.append("For the HSBC Life plan, client has been informed of the plan structure, premium commitment, policy currency, surrender terms, charges, non-guaranteed elements, investment/index-linked risks where applicable, and the relevant HSBC application documents before deciding to proceed.")
     else:
         base.append("For FWD Invest Flexi Elite, client has been informed of the plan features, premium commitment, flexibility, charges and investment risks before deciding to proceed.")
     base.append("The investment exposure remains within the client's disclosed financial position and the client has indicated sufficient liquidity to continue with the proposed arrangement.")
@@ -540,6 +912,18 @@ def recommendation_text(data: dict[str, Any], product_type: str, expected_retire
 def build_case(paths: list[Path], adviser_email: str, product_type: str, expected_retirement_income: str = "") -> dict[str, Any]:
     text, fields = all_text_and_fields(paths)
     data = extract_client(text, fields, adviser_email, product_type)
+    # The first uploaded file is the Client NRIC / ID. Prefer it for ID fields,
+    # because BI PDFs often do not contain the NRIC and scanned IDs need OCR/vision.
+    id_data = extract_id_document(paths[0]) if paths else {}
+    for key, val in id_data.items():
+        if not val:
+            continue
+        if key in {"nric", "dob", "gender", "nationality", "birthplace", "residential_address", "postal"}:
+            data[key] = val
+        elif not data.get(key):
+            data[key] = val
+    if data.get("dob") and not data.get("age_next"):
+        data["age_next"] = age_next_birthday(data["dob"])
     data["product_type"] = product_type
     data["expected_retirement_income"] = expected_retirement_income
     data.update(retirement_calc(expected_retirement_income, data.get("cpf_life_income", "")))
