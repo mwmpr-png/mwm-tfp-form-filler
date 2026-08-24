@@ -4,22 +4,57 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Generated TFP and Insurer Output</title>
   <style>
-    :root { --navy:#13264a; --bg:#f5f7fb; --border:#dbe2ea; --text:#0b1730; --gold:#b59b63; }
+    :root {
+      --navy:#13264a; --bg:#f5f7fb; --border:#dbe2ea; --text:#0b1730; --gold:#b59b63;
+      --muted:#5b6575; --danger:#a61b1b; --danger-bg:#fff4f4; --danger-border:#edb6b6;
+      --warn:#8a5a00; --warn-bg:#fff8e8; --warn-border:#ecd49d;
+      --ok:#16834a; --ok-bg:#f3fff7; --ok-border:#b7dfc7;
+    }
+    * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--text); font-family:Arial, sans-serif; }
     .hero { background:#fff; border-bottom:1px solid var(--border); padding:22px 36px; }
     .hero-inner { max-width:1160px; margin:0 auto; display:flex; align-items:center; gap:22px; }
     .logo { width:260px; max-width:36vw; height:auto; }
     .brand-text { letter-spacing:2px; color:var(--gold); font-weight:800; font-size:13px; margin-bottom:6px; }
     h1 { margin:0; font-size:28px; color:var(--navy); }
-    .wrap { max-width:1000px; margin:34px auto; padding:0 18px; }
+    h2 { color:var(--navy); margin:0 0 12px; }
+    h3 { margin:0; font-size:17px; }
+    .wrap { max-width:1040px; margin:34px auto; padding:0 18px; }
     .card { background:white; border:1px solid var(--border); border-radius:14px; padding:30px; }
     a.button { display:inline-block; background:var(--navy); color:white; padding:12px 18px; border-radius:8px; text-decoration:none; font-weight:700; margin:8px 8px 8px 0; }
     .secondary { background:#eef2f8 !important; color:#13264a !important; }
-    .summary { background:#fbfcfe; border:1px solid var(--border); border-radius:10px; padding:18px; margin-top:18px; }
-    .notice { background:#fff8e8; border:1px solid #ecd49d; border-left:5px solid var(--gold); border-radius:10px; padding:18px; margin:18px 0; }
+    .summary { background:#fbfcfe; border:1px solid var(--border); border-radius:10px; padding:18px; margin-top:18px; line-height:1.65; }
+    .notice { background:var(--warn-bg); border:1px solid var(--warn-border); border-left:5px solid var(--gold); border-radius:10px; padding:18px; margin:18px 0; }
     .notice a { color:var(--navy); font-weight:700; word-break:break-all; }
+    .review { margin-top:24px; border:1px solid var(--border); border-radius:12px; padding:20px; }
+    .review-head { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+    .review-title { margin:0; }
+    .review-sub { color:var(--muted); font-size:14px; line-height:1.45; margin:5px 0 0; }
+    .counts { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:16px 0 18px; }
+    .count { border:1px solid var(--border); border-radius:10px; padding:12px; }
+    .count strong { display:block; font-size:22px; }
+    .count span { font-size:12px; color:var(--muted); }
+    .count.action { background:var(--danger-bg); border-color:var(--danger-border); }
+    .count.review { background:var(--warn-bg); border-color:var(--warn-border); }
+    .count.checked { background:var(--ok-bg); border-color:var(--ok-border); }
+    .group { margin-top:18px; }
+    .items { display:grid; gap:9px; margin-top:9px; }
+    .item { border:1px solid var(--border); border-radius:10px; padding:12px 14px; line-height:1.42; }
+    .item.action { background:var(--danger-bg); border-color:var(--danger-border); }
+    .item.review { background:var(--warn-bg); border-color:var(--warn-border); }
+    .item.checked { background:var(--ok-bg); border-color:var(--ok-border); }
+    .item-title { font-weight:800; }
+    .item-detail { margin-top:3px; color:#3d4858; font-size:13px; }
+    .page { display:inline-block; margin-top:6px; font-size:11px; color:var(--muted); font-weight:700; }
+    details { margin-top:18px; }
+    details summary { cursor:pointer; color:var(--ok); font-weight:700; }
+    .review-foot { color:var(--muted); font-size:12px; line-height:1.45; margin:16px 0 0; }
     iframe { width:100%; height:720px; border:1px solid var(--border); border-radius:10px; background:white; }
-    @media(max-width:760px){ .hero-inner{flex-direction:column; align-items:flex-start;} .logo{max-width:100%; width:240px;} }
+    .preview-title { margin-top:28px; }
+    @media(max-width:760px){
+      .hero-inner{flex-direction:column; align-items:flex-start;} .logo{max-width:100%; width:240px;}
+      .card{padding:20px;} .counts{grid-template-columns:1fr;} iframe{height:560px;}
+    }
   </style>
 </head>
 <body>
@@ -44,13 +79,79 @@
     {% endif %}
     {% for name, url in notice_outputs %}<a class="button secondary" href="{{ url }}" target="_blank">{{ name }}</a>{% endfor %}
     <br><a class="button secondary" href="{{ zip_url }}">Download as ZIP</a>
+
     <div class="summary">
       <strong>Detected client:</strong> {{ data.client_name or 'Not detected' }}<br>
       <strong>NRIC:</strong> {{ data.nric or 'Not detected' }}<br>
       <strong>Plan:</strong> {{ data.plan_name or 'Not detected' }}<br>
       <strong>Premium:</strong> {{ data.premium or 'Not detected' }}
     </div>
-    <h2>Preview Completed TFP</h2>
+
+    {% if needs_attention %}
+    <section class="review" aria-label="Needs Attention">
+      <div class="review-head">
+        <div>
+          <h2 class="review-title">Needs Attention</h2>
+          <p class="review-sub">The TFP has already been generated. Review these items before submission and make any factual corrections directly in the editable TFP.</p>
+        </div>
+      </div>
+
+      <div class="counts">
+        <div class="count action"><strong>{{ needs_attention.get('counts', {}).get('action_required', 0) }}</strong><span>Action Required</span></div>
+        <div class="count review"><strong>{{ needs_attention.get('counts', {}).get('please_review', 0) }}</strong><span>Please Review</span></div>
+        <div class="count checked"><strong>{{ needs_attention.get('counts', {}).get('checked', 0) }}</strong><span>Checked</span></div>
+      </div>
+
+      {% if needs_attention.get('action_required') %}
+      <div class="group">
+        <h3>🔴 Action Required</h3>
+        <div class="items">
+          {% for item in needs_attention.get('action_required', []) %}
+          <div class="item action">
+            <div class="item-title">{{ item.get('label', '') }}</div>
+            <div class="item-detail">{{ item.get('detail', '') }}</div>
+            {% if item.get('page') %}<span class="page">{{ item.get('page') }}</span>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if needs_attention.get('please_review') %}
+      <div class="group">
+        <h3>🟠 Please Review</h3>
+        <div class="items">
+          {% for item in needs_attention.get('please_review', []) %}
+          <div class="item review">
+            <div class="item-title">{{ item.get('label', '') }}</div>
+            <div class="item-detail">{{ item.get('detail', '') }}</div>
+            {% if item.get('page') %}<span class="page">{{ item.get('page') }}</span>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if needs_attention.get('checked') %}
+      <details>
+        <summary>✅ Show checks completed by Ai ({{ needs_attention.get('counts', {}).get('checked', 0) }})</summary>
+        <div class="items">
+          {% for item in needs_attention.get('checked', []) %}
+          <div class="item checked">
+            <div class="item-title">{{ item.get('label', '') }}</div>
+            <div class="item-detail">{{ item.get('detail', '') }}</div>
+            {% if item.get('page') %}<span class="page">{{ item.get('page') }}</span>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </details>
+      {% endif %}
+
+      <p class="review-foot">Ai leaves unsupported client facts blank rather than copying values from an approved reference case. Product-specific wording is used only where it is supported by the configured product rules or uploaded documents.</p>
+    </section>
+    {% endif %}
+
+    <h2 class="preview-title">Preview Completed TFP</h2>
     {% if outputs %}<iframe src="{{ outputs[0][1] }}"></iframe>{% endif %}
   </div></div>
 </body>
