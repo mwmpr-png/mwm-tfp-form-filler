@@ -129,12 +129,13 @@ PRODUCT_PROFILES: dict[str, ProductProfile] = {
         label="IFAST Unit Trust",
         company="IFAST",
         category="unit_trust",
-        premium_mode="single",
+        # IFAST is a platform and may be used for lump-sum or regular investing.
+        # Determine the transaction mode from the actual case rather than the platform name.
+        premium_mode="unknown",
         requires_cka=True,
         disclosure_checklist="unit_trust",
         product_feature_text=(
-            "IFAST provides access to investment products such as unit trusts. "
-            "The selected fund(s), allocation and asset class should follow the applicable fund factsheet(s)."
+            "IFAST provides access to investment products such as unit trusts and other supported investment solutions."
         ),
         limitation_text="Market risk applies. Returns, distributions and capital are not guaranteed.",
         charges_text="Net returns are reduced by applicable ongoing fees and charges, including wrap/platform fees where applicable. Refer to the IFAST documents.",
@@ -245,6 +246,38 @@ PRODUCT_PROFILES: dict[str, ProductProfile] = {
 
 
 def classify_product(data: dict[str, Any], product_type: str = "", source_text: str = "") -> ProductProfile:
+    # Once a case has already been enriched, preserve that explicit classification.
+    # This is important when pdf_fill.py receives the enriched case without the original
+    # source-text blob (for example IFAST, where the platform name may live in Page 13).
+    explicit_key = clean(data.get("product_profile_key"))
+    explicit_category = clean(data.get("product_category"))
+    explicit_mode = clean(data.get("premium_mode"))
+    if explicit_key in PRODUCT_PROFILES:
+        base = PRODUCT_PROFILES[explicit_key]
+        overrides = dict(base.__dict__)
+        if explicit_category:
+            overrides["category"] = explicit_category
+        if explicit_mode in {"annual", "single", "unknown"}:
+            overrides["premium_mode"] = explicit_mode
+        if isinstance(data.get("requires_cka"), bool):
+            overrides["requires_cka"] = data["requires_cka"]
+        if clean(data.get("disclosure_checklist")):
+            overrides["disclosure_checklist"] = clean(data.get("disclosure_checklist"))
+        return ProductProfile(**overrides)
+    if explicit_key == "generic_ilp" or (explicit_category == "ilp" and data.get("requires_cka") is True):
+        return ProductProfile(
+            key="generic_ilp",
+            label=clean(data.get("plan_name")) or "Investment-linked plan",
+            company=clean(data.get("insurer_name") or data.get("insurer") or product_type),
+            category="ilp",
+            premium_mode=explicit_mode if explicit_mode in {"annual", "single"} else "unknown",
+            requires_cka=True,
+            disclosure_checklist=clean(data.get("disclosure_checklist")) or "life",
+            product_feature_text="Investment-linked plan; use the insurer Product Summary for exact benefits and terms.",
+            limitation_text="Investment values fluctuate and returns are not guaranteed. Use the Product Summary for surrender and withdrawal terms.",
+            charges_text="Use the Product Summary for the exact ongoing fees and charges.",
+        )
+
     blob = " ".join(
         [
             clean(data.get("plan_name")),
@@ -407,15 +440,43 @@ def _extract_fund_risk_from_text(text: str) -> str:
 
 
 def _extract_time_horizon(fields: dict[str, Any], data: dict[str, Any]) -> str:
-    value = _field(fields, "Text38") or clean(data.get("investment_time_horizon"))
-    if value:
-        return value
-    term = clean(data.get("policy_term"))
-    return term
+    """Return the CLIENT'S investment horizon only.
 
+    Do not substitute a policy term (for example "Up to age 99") when the
+    client's investment horizon is missing. The missing horizon belongs in
+    Needs Attention instead of being silently converted into a Page-13 answer.
+    """
+    return _field(fields, "Text38") or clean(data.get("investment_time_horizon"))
+
+
+def _horizon_from_risk_taking(risk_taking: str) -> str:
+    code = clean(risk_taking).upper()[:1]
+    # Page-10 bands. Bryan's approved examples display >10 years for High.
+    return {"H": ">10 years", "M": "3 to <10 years", "L": "<3 years"}.get(code, "")
 
 def _extract_funds(fields: dict[str, Any], data: dict[str, Any], source_text: str) -> list[dict[str, str]]:
     funds: list[dict[str, str]] = []
+
+    # Preserve structured multi-fund data when the caller has it, including a
+    # per-fund risk classification. This lets the lower-risk rule apply if ANY
+    # selected fund is below the client's profile.
+    supplied = data.get("funds")
+    if isinstance(supplied, list):
+        for item in supplied[:7]:
+            if not isinstance(item, dict):
+                continue
+            name = clean(item.get("name"))
+            if not name:
+                continue
+            funds.append({
+                "name": name,
+                "asset_class": clean(item.get("asset_class")),
+                "amount": clean(item.get("amount") or item.get("invested_amount")),
+                "risk_profile": normalise_risk(item.get("risk_profile") or item.get("fund_risk_profile")),
+            })
+        if funds:
+            return funds
+
     for i in range(1, 8):
         name_field = f"Name of Fund Manager  Investment Product{i}"
         asset_field = "Asset Class" if i == 1 else f"Asset Class_{i}"
@@ -429,17 +490,18 @@ def _extract_funds(fields: dict[str, Any], data: dict[str, Any], source_text: st
         if not amount and i == 1:
             amount = clean(data.get("fund_invested_amount"))
         if name:
-            funds.append({"name": name, "asset_class": asset, "amount": amount})
+            fund = {"name": name, "asset_class": asset, "amount": amount}
+            if i == 1 and normalise_risk(data.get("fund_risk_profile")):
+                fund["risk_profile"] = normalise_risk(data.get("fund_risk_profile"))
+            funds.append(fund)
     if not funds and clean(data.get("fund_name")):
-        funds.append(
-            {
-                "name": clean(data.get("fund_name")),
-                "asset_class": clean(data.get("asset_class")) or _extract_asset_class_from_text(source_text),
-                "amount": clean(data.get("fund_invested_amount")),
-            }
-        )
+        funds.append({
+            "name": clean(data.get("fund_name")),
+            "asset_class": clean(data.get("asset_class")) or _extract_asset_class_from_text(source_text),
+            "amount": clean(data.get("fund_invested_amount")),
+            "risk_profile": normalise_risk(data.get("fund_risk_profile")),
+        })
     return funds
-
 
 def extract_compliance_facts(
     data: dict[str, Any],
@@ -505,7 +567,6 @@ def extract_compliance_facts(
         facts["annual_budget_source"]
         or facts["single_budget_source"]
         or clean(data.get("source_of_funds"))
-        or clean(data.get("source_of_income"))
     )
 
     # Page 9 savings/investment FNA (reference case fields).
@@ -602,7 +663,29 @@ def extract_compliance_facts(
     facts["investment_risk_text"] = _field(fields, "8 The Nature of Product  Investment Risk", "8 The Nature of Product Investment Risk") or clean(data.get("investment_risk_text"))
     facts["other_product_limitations"] = _field(fields, "Text41") or clean(data.get("other_product_limitations"))
     facts["investment_objective_text"] = _field(fields, "Text37") or clean(data.get("investment_objective_text"))
-    facts["investment_time_horizon"] = _extract_time_horizon(fields, data)
+    facts["investment_time_horizon"] = _extract_time_horizon(fields, data) or _horizon_from_risk_taking(risk_taking)
+
+    # Client/adviser actions are only treated as facts when explicitly recorded.
+    # If this is an already-completed TFP, read the evidence from its BOR field.
+    bor_source = ""
+    for field_name, field_value in fields.items():
+        if "Business Trail and why was the product" in str(field_name):
+            bor_source = clean(field_value)
+            if bor_source:
+                break
+    bor_low = bor_source.lower()
+    facts["factsheet_presented"] = bool(
+        data.get("factsheet_presented") is True
+        or (bor_source and re.search(r"fund factsheet(?:\(s\)|s)?[^.\n]{0,24}presented", bor_low, flags=re.I))
+    )
+    facts["lower_risk_preference"] = bool(
+        data.get("lower_risk_preference") is True
+        or (bor_source and re.search(r"preference.*lower[- ]risk|lower[- ]risk approach", bor_low, flags=re.I))
+    )
+    facts["risk_mismatch_acknowledged"] = bool(
+        data.get("risk_mismatch_acknowledged") is True
+        or (bor_source and re.search(r"acknowledged the mismatch|comfortable proceeding", bor_low, flags=re.I))
+    )
 
     # Distribution wording must be supported by actual text; do not infer solely from "Income" in a fund name.
     facts["distribution_fund"] = bool(
@@ -683,19 +766,40 @@ def apply_product_fna(data: dict[str, Any], facts: dict[str, Any], profile: Prod
 
 
 def _choose_budget(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> tuple[float, str, str]:
-    if profile.premium_mode == "single":
-        amount = money_number(facts.get("single_budget")) or money_number(data.get("premium"))
+    """Choose the actual transaction budget/mode before using a product default.
+
+    This matters for platforms and future products that can support either regular or
+    lump-sum investing.  Explicit Page-8 budget fields always outrank the product label.
+    """
+    annual = money_number(facts.get("annual_budget"))
+    single = money_number(facts.get("single_budget"))
+
+    if annual and not single:
+        return annual, clean(facts.get("annual_budget_source")) or clean(facts.get("source_of_funds")), "annual"
+    if single and not annual:
+        return single, clean(facts.get("single_budget_source")) or clean(facts.get("source_of_funds")), "single"
+
+    explicit_mode = clean(data.get("premium_mode")).lower()
+    if explicit_mode not in {"annual", "single"}:
+        frequency_blob = " ".join([clean(data.get("premium_frequency")), clean(data.get("premium_term"))]).lower()
+        explicit_mode = _premium_mode_from_text(frequency_blob)
+
+    mode = explicit_mode if explicit_mode in {"annual", "single"} else profile.premium_mode
+    if mode == "single":
+        amount = single or money_number(data.get("premium"))
         source = clean(facts.get("single_budget_source")) or clean(facts.get("source_of_funds"))
         return amount, source, "single"
-    if profile.premium_mode == "annual":
-        amount = money_number(facts.get("annual_budget")) or money_number(data.get("premium"))
+    if mode == "annual":
+        amount = annual or money_number(data.get("premium"))
         source = clean(facts.get("annual_budget_source")) or clean(facts.get("source_of_funds"))
         return amount, source, "annual"
-    # Unknown product: preserve explicitly filled budget mode if available.
-    if money_number(facts.get("annual_budget")):
-        return money_number(facts["annual_budget"]), clean(facts.get("annual_budget_source")), "annual"
-    if money_number(facts.get("single_budget")):
-        return money_number(facts["single_budget"]), clean(facts.get("single_budget_source")), "single"
+
+    # If both budget columns are populated, preserve the product/context default only if
+    # it is known; otherwise leave mode unresolved rather than guessing.
+    if annual and profile.premium_mode == "annual":
+        return annual, clean(facts.get("annual_budget_source")) or clean(facts.get("source_of_funds")), "annual"
+    if single and profile.premium_mode == "single":
+        return single, clean(facts.get("single_budget_source")) or clean(facts.get("source_of_funds")), "single"
     return money_number(data.get("premium")), clean(facts.get("source_of_funds")), "unknown"
 
 
@@ -742,20 +846,42 @@ def affordability_assessment(data: dict[str, Any], facts: dict[str, Any], profil
 
 
 def risk_comparison(facts: dict[str, Any]) -> str:
+    """Compare client risk against all known selected-fund risks.
+
+    Any higher-risk fund returns ``higher``. Otherwise any lower-risk fund
+    returns ``lower`` so the required lower-risk disclaimer is triggered.
+    ``match`` is returned only when all known selected fund risks match.
+    """
     client = normalise_risk(facts.get("risk_profile"))
-    fund = normalise_risk(facts.get("fund_risk_profile"))
-    if not client or not fund:
+    if not client:
         return "unknown"
     c = RISK_ORDER.get(client.lower())
-    f = RISK_ORDER.get(fund.lower())
-    if c is None or f is None:
+    if c is None:
         return "unknown"
-    if f == c:
-        return "match"
-    if f < c:
-        return "lower"
-    return "higher"
 
+    fund_risks: list[str] = []
+    for fund in facts.get("funds") or []:
+        r = normalise_risk(fund.get("risk_profile") or fund.get("fund_risk_profile"))
+        if r:
+            fund_risks.append(r)
+    single = normalise_risk(facts.get("fund_risk_profile"))
+    if single and single not in fund_risks:
+        fund_risks.append(single)
+    if not fund_risks:
+        return "unknown"
+
+    deltas: list[int] = []
+    for r in fund_risks:
+        f = RISK_ORDER.get(r.lower())
+        if f is not None:
+            deltas.append(f - c)
+    if not deltas:
+        return "unknown"
+    if any(x > 0 for x in deltas):
+        return "higher"
+    if any(x < 0 for x in deltas):
+        return "lower"
+    return "match"
 
 def priority_selections(data: dict[str, Any], profile: ProductProfile) -> dict[str, str]:
     """Return Page-5 choices: high/medium/low/na for the eight Yourself rows."""
@@ -778,20 +904,11 @@ def priority_selections(data: dict[str, Any], profile: ProductProfile) -> dict[s
                 p[key] = "na" if val == "n/a" else val
         return p
 
-    retirement_goal = money_number(data.get("expected_retirement_income")) > 0
-    if retirement_goal:
-        p["retirement"] = "high"
-        if profile.category in {"ilp", "unit_trust"}:
-            p["investment"] = "medium"
-        if profile.category == "ilp":
-            p["death"] = "low"
-    elif profile.category in {"ilp", "unit_trust"}:
-        p["investment"] = "high"
-        if profile.category == "ilp":
-            p["death"] = "low"
-    elif profile.category == "participating_life":
-        p["retirement"] = "high" if retirement_goal else "medium"
-    return p
+    # No explicit Page-5 priority evidence: do not infer a client's personal
+    # priorities from the product selected or from the fact that a retirement
+    # income figure was entered. Page 5 is left untouched and Needs Attention
+    # asks the adviser to confirm the client's actual priorities.
+    return {}
 
 
 # Page 5 exact field map for the Nov-2025 TFP.
@@ -822,92 +939,209 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
     affordability = facts.get("affordability") or {}
     checks: list[dict[str, str]] = []
 
-    def add(code: str, label: str, status: str, detail: str) -> None:
-        checks.append({"code": code, "label": label, "status": status, "detail": detail})
+    def add(code: str, label: str, status: str, detail: str, page: str = "", level: str | None = None) -> None:
+        if level is None:
+            level = "checked" if status == "PASS" else "please_review"
+        checks.append({"code": code, "label": label, "status": status, "detail": detail, "page": page, "level": level})
 
-    # Financial data / budget source.
     if facts.get("annual_income") and facts.get("annual_expenses"):
-        add("cashflow", "Cash flow", "PASS", "Actual income and expenses are available; no default expense has been invented.")
+        add("cashflow", "Cash flow", "PASS", "Actual income and expenses are available; no default expense has been invented.", "Page 8")
     else:
-        add("cashflow", "Cash flow", "REVIEW", "Income and/or expenses are not supported by uploaded data. Leave missing figures blank and obtain the client's actual data.")
+        add("cashflow", "Cash flow", "REVIEW", "Income and/or annual expenses are missing from the uploaded information. Complete the actual client figures in the editable TFP.", "Page 8", "action_required")
 
     budget = affordability.get("budget_amount") or 0
     source = clean(affordability.get("budget_source"))
     if budget and source:
         substantial = affordability.get("budget_substantial")
         if substantial is False:
-            add("budget", "Budget / concentration", "PASS", f"Budget source recorded as {source}; the documented funding-base ratio is below 50%.")
+            add("budget", "Budget / concentration", "PASS", f"Budget source recorded as {source}; the documented funding-base ratio is below 50%.", "Page 8")
         elif substantial is True:
-            add("budget", "Budget / concentration", "FAIL", f"Budget source recorded as {source}; the budget exceeds 50% of a documented funding base.")
+            add("budget", "Budget / concentration", "FAIL", f"Budget source recorded as {source}; the budget exceeds 50% of at least one documented funding base. Review affordability/concentration before submission.", "Pages 8 & 19", "please_review")
         else:
-            add("budget", "Budget / concentration", "REVIEW", f"Budget is available and source is {source}, but the correct surplus/assets funding base cannot be fully verified.")
+            add("budget", "Budget / concentration", "REVIEW", f"Budget and source ({source}) are available, but the correct surplus/assets funding base cannot be fully verified.", "Pages 8 & 19", "action_required")
     elif budget:
-        add("budget", "Budget / concentration", "REVIEW", "Proposed premium/budget is available but source of funds is missing.")
+        add("budget", "Source of funds", "REVIEW", "The proposed premium/budget is available but the transaction source of funds is missing. Do not substitute the client's general source of income.", "Pages 8 & 17", "action_required")
     else:
-        add("budget", "Budget / concentration", "REVIEW", "Budget amount is missing.")
+        add("budget", "Budget amount", "REVIEW", "The transaction budget/premium could not be confirmed.", "Page 8", "action_required")
 
     if affordability.get("rsp_to_income") is not None:
         ratio = affordability["rsp_to_income"]
-        add("supervisor_affordability", "Supervisor affordability", "PASS" if ratio < 0.5 else "FAIL", f"RSP / annual income = {_percent(ratio)} (target < 50%).")
+        add("supervisor_affordability", "Regular-premium affordability", "PASS" if ratio < 0.5 else "FAIL", f"RSP / annual income = {_percent(ratio)} (target < 50%).", "Page 19", "checked" if ratio < 0.5 else "please_review")
     if affordability.get("lump_sum_to_assets") is not None:
         ratio = affordability["lump_sum_to_assets"]
-        add("supervisor_concentration", "Supervisor concentration", "PASS" if ratio < 0.5 else "FAIL", f"Lump sum / total assets = {_percent(ratio)} (target < 50%).")
+        add("supervisor_concentration", "Lump-sum concentration", "PASS" if ratio < 0.5 else "FAIL", f"Lump sum / total assets = {_percent(ratio)} (target < 50%).", "Page 19", "checked" if ratio < 0.5 else "please_review")
 
-    # FNA.
     if profile.key == "ilp_10_flex_3":
         if facts.get("investment_goal") and facts.get("investment_existing") and facts.get("investment_amount_to_plan"):
-            add("fna", "Savings / investment FNA", "PASS", "10-Flex-3 target, Page-8 existing investments and amount-to-plan are reconciled.")
+            add("fna", "Savings / investment FNA", "PASS", "Target, Page-8 existing investments and amount-to-plan are reconciled.", "Page 9")
         else:
-            add("fna", "Savings / investment FNA", "REVIEW", "10-Flex-3 FNA needs Page-8 existing investment data before the amount-to-plan can be completed.")
+            add("fna", "Savings / investment FNA", "REVIEW", "Investment-needs FNA needs the actual existing investment amount before the amount-to-plan can be completed safely.", "Pages 8 & 9", "action_required")
 
-    # Risk and fund factsheet.
     if facts.get("risk_profile"):
-        add("risk_profile", "Client risk profile", "PASS", f"Assigned profile: {facts['risk_profile']}.")
+        add("risk_profile", "Client risk profile", "PASS", f"Assigned profile: {facts['risk_profile']}.", "Pages 10 & 13")
     elif profile.category in {"ilp", "unit_trust"}:
-        add("risk_profile", "Client risk profile", "REVIEW", "Client risk profile is not supported by the uploaded data; do not hardcode Balanced/B.")
+        add("risk_profile", "Client risk profile", "REVIEW", "Client risk profile cannot be determined from the uploaded data. Do not assume Balanced/Aggressive or copy a reference case.", "Pages 10 & 13", "action_required")
 
     if profile.category in {"ilp", "unit_trust"}:
-        if facts.get("asset_class"):
-            add("asset_class", "Fund asset class", "PASS", f"Asset class captured as {facts['asset_class']}.")
+        if facts.get("investment_time_horizon"):
+            add("time_horizon", "Investment time horizon", "PASS", f"Investment horizon: {facts['investment_time_horizon']}.", "Pages 10 & 13")
         else:
-            add("asset_class", "Fund asset class", "REVIEW", "Asset class is missing. Obtain it from the fund factsheet.")
+            add("time_horizon", "Investment time horizon", "REVIEW", "Client investment horizon is missing. The policy term is not used as a substitute.", "Pages 10 & 13", "action_required")
+        if facts.get("asset_class"):
+            add("asset_class", "Fund asset class", "PASS", f"Asset class captured as {facts['asset_class']}.", "Page 13")
+        else:
+            add("asset_class", "Fund asset class", "REVIEW", "Asset class is missing. Obtain it from the fund factsheet.", "Page 13", "action_required")
         comparison = risk_comparison(facts)
         if comparison == "match":
-            add("fund_risk", "Fund risk vs client", "PASS", "Fund risk matches the client's risk profile.")
+            add("fund_risk", "Fund risk vs client", "PASS", "Selected fund risk matches the client's risk profile.", "Pages 13-14")
         elif comparison == "lower":
-            add("fund_risk", "Fund risk vs client", "REVIEW", "At least one selected fund is lower risk than the client profile; include the lower-risk-fund disclaimer.")
+            add("fund_risk", "Fund risk vs client", "REVIEW", "At least one selected fund is lower risk than the client profile. The lower-risk-fund disclaimer is included without inventing client acknowledgement.", "Page 14", "please_review")
+            if not facts.get("lower_risk_preference"):
+                add("lower_risk_rationale", "Lower-risk fund rationale", "REVIEW", "Record/confirm the client's actual reason for choosing the lower-risk fund; the system will not invent a lower-risk preference.", "Page 14", "action_required")
+            if not facts.get("risk_mismatch_acknowledged"):
+                add("risk_ack", "Risk mismatch acknowledgement", "REVIEW", "Confirm that the mismatch and possible lower returns have been explained and acknowledged before submission.", "Page 14", "action_required")
         elif comparison == "higher":
-            add("fund_risk", "Fund risk vs client", "FAIL", "Selected fund risk is higher than the client profile; suitability requires review.")
+            add("fund_risk", "Fund risk vs client", "FAIL", "At least one selected fund is higher risk than the client profile. Suitability requires review before submission.", "Pages 13-14", "please_review")
         else:
-            add("fund_risk", "Fund risk vs client", "REVIEW", "Fund risk rating could not be matched to the client. Use insurer rating first, then FSM where appropriate.")
+            add("fund_risk", "Fund risk vs client", "REVIEW", "Fund risk rating could not be matched to the client. Use insurer risk rating first, then FSM where appropriate; for Tokio Marine's four-scale ratings, use FSM as guided by Compliance.", "Pages 13-14", "action_required")
 
-    # CKA.
+        if facts.get("funds"):
+            if facts.get("factsheet_presented"):
+                add("factsheet", "Fund factsheet", "PASS", "Fund factsheet presentation is explicitly recorded.", "Page 14")
+            else:
+                add("factsheet", "Fund factsheet", "REVIEW", "Confirm that the applicable fund factsheet(s) were presented to the client. The TFP does not state this unless supported.", "Page 14", "action_required")
+
+    if profile.category in {"ilp", "unit_trust", "participating_life"}:
+        if _product_objective(data, facts, profile):
+            add("objective", "Investment / insurance objective", "PASS", "Client objective is supported by the uploaded information or stated retirement-income input.", "Page 13")
+        else:
+            add("objective", "Investment / insurance objective", "REVIEW", "Client-specific objective is missing; the selected product is not used to invent the client's objective.", "Page 13", "action_required")
+        if facts.get("expected_rate_of_return"):
+            add("expected_return", "Expected rate of return", "PASS", f"Recorded expected rate of return: {facts['expected_rate_of_return']}.", "Page 13")
+        else:
+            add("expected_return", "Expected rate of return", "REVIEW", "Expected return is not supported by the uploaded information. Do not copy 6-8% or another reference-case figure.", "Page 13", "action_required")
+
     if profile.requires_cka:
         if facts.get("cka_met") is True:
-            add("cka", "CKA", "PASS", "At least one qualifying CKA knowledge/experience criterion is explicitly met.")
+            add("cka", "CKA", "PASS", "At least one qualifying CKA knowledge/experience criterion is explicitly met.", "Pages 11-12")
         elif facts.get("cka_met") is False:
-            add("cka", "CKA", "REVIEW", "CKA outcome is NOT MET. The acknowledgement/advice path on Page 12 must be completed correctly.")
+            add("cka", "CKA", "REVIEW", "CKA outcome is NOT MET. Complete the correct advice/suitability/acknowledgement path on Page 12.", "Pages 11-12", "action_required")
         else:
-            add("cka", "CKA", "REVIEW", "CKA cannot be determined from general job title/education level alone. Confirm qualifying education/professional qualification, transaction experience and work experience.")
+            add("cka", "CKA", "REVIEW", "CKA cannot be determined from a general job title or education label alone. Confirm the qualifying CKA criteria.", "Pages 11-12", "action_required")
         if facts.get("is_joint_case"):
-            add("joint_cka", "Joint CKA", "REVIEW", "Joint case detected. A separate CKA is required for the other relevant client/account holder.")
+            add("joint_cka", "Joint CKA", "REVIEW", "Joint case detected. Complete a separate CKA for the other relevant client/account holder.", "Pages 11-12", "action_required")
 
-    # Selected client / trusted individual.
     if facts.get("selected_client") is True:
-        add("selected_client", "Selected Client", "REVIEW", "Client meets at least 2 of the 3 Selected Client indicators. Trusted Individual requirements must be addressed.")
+        add("selected_client", "Selected Client", "REVIEW", "Client meets at least 2 of the 3 Selected Client indicators. Trusted Individual requirements must be addressed.", "Page 4", "action_required")
     elif facts.get("selected_client") is None:
-        add("selected_client", "Selected Client", "REVIEW", "Selected Client status cannot be fully determined because English proficiency and/or education level is incomplete.")
+        add("selected_client", "Selected Client", "REVIEW", "Selected Client status cannot be fully determined because English proficiency and/or education level is incomplete.", "Page 4", "action_required")
 
-    # Signatures and priorities are generated/stamped elsewhere but must still be reviewed.
-    add("signatures", "Signatures", "REVIEW", "Double-check every applicable signature/date, including Page 8, CKA acknowledgement (if applicable), disclosure checklist, Page 17, Page 18 and FA declaration.")
-    add("priorities", "Personal priorities", "PASS", "Page-5 priorities are derived from the stated objective; verify them against the client's actual priorities before submission.")
+    # Pages 15-16: exactly one disclosure route should apply to the transaction.
+    if profile.disclosure_checklist == "life":
+        add("disclosure_route", "Disclosure checklist", "PASS", "Life / ILP disclosure checklist route selected; Unit Trust checklist is not selected.", "Page 15")
+    elif profile.disclosure_checklist == "unit_trust":
+        add("disclosure_route", "Disclosure checklist", "PASS", "Unit Trust disclosure checklist route selected; Life / ILP checklist is not selected.", "Page 16")
+    else:
+        add("disclosure_route", "Disclosure checklist", "REVIEW", "The applicable disclosure checklist could not be determined from the product classification.", "Pages 15-16", "action_required")
+
+    # Page 17: source of funds is a transaction fact, not a synonym for occupation/source of income.
+    if clean(facts.get("source_of_funds")):
+        add("aml_source", "AML / source of funds", "PASS", f"Transaction source of funds recorded as {clean(facts.get('source_of_funds'))}.", "Page 17")
+    else:
+        add("aml_source", "AML / source of funds", "REVIEW", "Transaction source of funds is not confirmed. Complete the actual payer/source information before submission.", "Page 17", "action_required")
+
+    # Page 18-20 remain human acknowledgements/declarations. The runtime layer adds a
+    # stronger Action Required item when a client/FA signature image was not uploaded.
+    add("acknowledgements", "Client / FA acknowledgements", "REVIEW", "Review the Page 18 client authorization, Page 19 suitability items and Page 20 FA declaration before submission; these are not inferred from the product selected.", "Pages 18-20", "please_review")
+    add("signatures", "Signatures", "REVIEW", "Double-check every applicable signature/date, including Page 8, CKA acknowledgement (if applicable), disclosure checklist, Page 17, Page 18 and FA declaration.", "Pages 8, 12, 15/16, 17, 18 & 20", "please_review")
+    priorities_source = clean(facts.get("priorities_source"))
+    if priorities_source in {"existing", "explicit"}:
+        add("priorities", "Personal priorities", "PASS", "Page-5 priorities are explicitly supported by the case data; verify before submission.", "Page 5")
+    else:
+        add("priorities", "Personal priorities", "REVIEW", "Page-5 priorities were not explicitly provided. Confirm the client's actual priorities before submission.", "Page 5", "action_required")
 
     return checks
 
-
-# ---------------------------------------------------------------------------
-# BOR / Page-13 narrative assembly
-# ---------------------------------------------------------------------------
+def _page13_defaults(profile: ProductProfile) -> dict[str, str]:
+    if profile.key == "ilp_10_flex_3":
+        return {
+            "features": "A whole-life, regular-premium investment-linked plan (ILP) providing investment opportunities together with insurance protection.",
+            "limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed. Investment carries risk.",
+            "charges": "Administrative charges, cost of insurance and other policy/fund charges: refer to the Product Summary.",
+            "investment_risk": "Liquidity risk and market risk",
+            "other_limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed. Long-term investment.",
+        }
+    if profile.key == "goelite":
+        return {
+            "features": "A whole-life, single-premium investment-linked plan (ILP) providing investment opportunities together with insurance protection.",
+            "limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed. Investment carries risk.",
+            "charges": "Administrative, establishment/insurance and other policy/fund charges: refer to the Product Summary.",
+            "investment_risk": "Liquidity risk and market risk",
+            "other_limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed.",
+        }
+    if profile.key == "ifast_unit_trust":
+        return {
+            "features": "IFAST provides access to a range of investment products and services, including unit trusts.",
+            "limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed. Investment carries risk.",
+            "charges": "Wrap fee and platform fee: refer to the applicable IFAST documents.",
+            "investment_risk": "Market risk",
+            "other_limitations": "Past performance, returns, distributions/dividends and capital are not guaranteed.",
+        }
+    if profile.key == "singlife_flexi_income":
+        return {
+            "features": "A participating whole-life insurance plan for wealth accumulation and income, with death and terminal-illness benefits. Refer to the Policy Illustration/Product Summary for exact guaranteed and non-guaranteed benefits.",
+            "limitations": "Liquidity risk, early-surrender risk and non-guaranteed returns/benefits.",
+            "charges": "Refer to the Product Summary and Policy Illustration.",
+            "investment_risk": "Some returns/benefits of the product are not guaranteed",
+            "other_limitations": "Liquidity risk, early-surrender risk and non-guaranteed returns/benefits.",
+        }
+    if profile.key == "fwd_invest_flexi_elite":
+        return {
+            "features": "An investment-linked life plan providing investment opportunities together with insurance protection. Refer to the FWD Product Summary for exact benefits and terms.",
+            "limitations": "Investment values fluctuate and returns/capital are not guaranteed. Refer to the Product Summary for surrender and withdrawal terms.",
+            "charges": "Refer to the FWD Product Summary for the exact charge names and rates.",
+            "investment_risk": "Liquidity risk and market/investment risk",
+            "other_limitations": "Past performance is not indicative of future performance. Investment returns and capital are not guaranteed.",
+        }
+    if profile.key == "hsbc_life":
+        if profile.category == "ilp":
+            return {
+                "features": "An HSBC Life investment-linked plan. Refer to the Benefit Illustration/Product Summary for the exact benefits and policy terms.",
+                "limitations": "Investment values fluctuate and returns/capital are not guaranteed. Refer to the Product Summary for product-specific limitations.",
+                "charges": "Refer to the HSBC Product Summary for the exact fees and charges.",
+                "investment_risk": "Market / investment risk",
+                "other_limitations": "Refer to the HSBC Product Summary for surrender, withdrawal and non-guaranteed elements.",
+            }
+        return {
+            "features": "Refer to the HSBC Benefit Illustration/Product Summary for the exact plan structure, benefits and policy term.",
+            "limitations": "Refer to the HSBC Product Summary for surrender terms and non-guaranteed elements.",
+            "charges": "Refer to the HSBC Product Summary for the exact fees and charges.",
+            "investment_risk": "",
+            "other_limitations": "Refer to the HSBC Product Summary for product-specific risks and limitations.",
+        }
+    if profile.category == "unit_trust":
+        return {
+            "features": "Unit trust investment; use the platform/product documents and fund factsheet(s) for the exact features.",
+            "limitations": "Past performance and investment returns/capital are not guaranteed.",
+            "charges": "Refer to the platform/product documents for applicable fees and charges.",
+            "investment_risk": "Market risk",
+            "other_limitations": "Investment carries risk and past performance is not indicative of future performance.",
+        }
+    if profile.category == "ilp":
+        return {
+            "features": "Investment-linked life plan; use the insurer Product Summary for exact benefits and terms.",
+            "limitations": "Investment values fluctuate and returns/capital are not guaranteed. Refer to the Product Summary for surrender and withdrawal terms.",
+            "charges": "Refer to the insurer Product Summary for the exact fees and charges.",
+            "investment_risk": "Liquidity risk and market/investment risk",
+            "other_limitations": "Investment carries risk and past performance is not indicative of future performance.",
+        }
+    return {
+        "features": profile.product_feature_text,
+        "limitations": profile.limitation_text,
+        "charges": profile.charges_text,
+        "investment_risk": "",
+        "other_limitations": profile.limitation_text,
+    }
 
 
 def _product_objective(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> str:
@@ -916,12 +1150,7 @@ def _product_objective(data: dict[str, Any], facts: dict[str, Any], profile: Pro
         return explicit
     if money_number(data.get("expected_retirement_income")) > 0:
         return "Retirement planning / wealth accumulation"
-    if profile.category in {"ilp", "unit_trust"}:
-        return "Savings / investment and wealth accumulation"
-    if profile.category == "participating_life":
-        return "Wealth accumulation and income planning"
     return ""
-
 
 def _fund_sentence(facts: dict[str, Any], profile: ProductProfile) -> str:
     funds = facts.get("funds") or []
@@ -940,44 +1169,48 @@ def _fund_sentence(facts: dict[str, Any], profile: ProductProfile) -> str:
 
 
 def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> str:
+    """Build a clean Page-14 BOR without in-document review markers."""
     age = clean(data.get("age_next") or data.get("age_last_birthday"))
     age_text = f" (ANB age {age})" if age else ""
     plan = clean(data.get("plan_name")) or profile.label
     objective = _product_objective(data, facts, profile)
     paragraphs: list[str] = []
 
-    if profile.key == "ifast_unit_trust":
-        paragraphs.append(f"Client{age_text} wishes to invest spare cash in the market and has expressed interest in the IFAST platform.")
-    elif profile.key in {"ilp_10_flex_3", "goelite"}:
-        paragraphs.append(f"Client{age_text} wishes to invest for wealth accumulation using an investment vehicle that also provides insurance protection elements.")
-    elif profile.key == "singlife_flexi_income":
-        paragraphs.append(f"Client{age_text} is looking for a wealth-accumulation plan with a stream of income and a lower-risk profile than a market-linked growth strategy.")
-    elif objective:
-        paragraphs.append(f"Client{age_text} has stated the objective of {objective.lower()}.")
+    if objective:
+        objective_sentence = objective.strip().rstrip(" .;:")
+        # Preserve the adviser/client wording instead of forcing it into a
+        # grammatical construction such as "objective of client looking...".
+        paragraphs.append(f"Client{age_text} stated the following objective: {objective_sentence}.")
 
     if plan:
         if profile.category == "unit_trust":
-            paragraphs.append(f"{plan} / the selected IFAST investment is recommended to address the stated investment objective. {profile.product_feature_text}")
+            prefix = f"{plan} / the selected investment is recommended"
         else:
-            paragraphs.append(f"{plan} is recommended based on the stated objective. {profile.product_feature_text}".strip())
+            prefix = f"{plan} is recommended" if objective else f"The recommended product is {plan}."
+        if objective:
+            prefix += " for the stated objective."
+        paragraphs.append(f"{prefix} {profile.product_feature_text}".strip())
 
     fund_sentence = _fund_sentence(facts, profile)
     if fund_sentence:
-        paragraphs.append(fund_sentence + " Fund factsheet(s) should be presented to the client and retained with the case documentation.")
+        paragraphs.append(fund_sentence)
+        if facts.get("factsheet_presented"):
+            paragraphs.append("The applicable fund factsheet(s) were presented to the client.")
 
     comparison = risk_comparison(facts)
     if comparison == "match":
         paragraphs.append("The selected fund risk rating matches the client's documented risk profile.")
     elif comparison == "lower":
-        paragraphs.append(
-            "Based on the client's expressed preference to adopt a lower-risk approach, lower-risk fund(s) were recommended. "
-            "It was explained that this may result in lower potential returns and the client may not achieve the intended financial objective within the desired timeframe. "
-            "The client acknowledged the mismatch and confirmed comfort with proceeding."
+        text = (
+            "At least one selected fund is lower risk than the client's documented risk profile. "
+            "A lower-risk fund may result in lower potential returns and the client may not achieve the intended financial objective within the desired timeframe."
         )
-    elif comparison == "higher":
-        paragraphs.append("[REVIEW REQUIRED] The selected fund risk appears higher than the client's documented risk profile. Suitability must be resolved before submission.")
-    elif profile.category in {"ilp", "unit_trust"}:
-        paragraphs.append("[REVIEW REQUIRED] Confirm the selected fund risk rating against the client's risk profile before submission.")
+        if facts.get("lower_risk_preference"):
+            text = "Based on the client's expressed preference to adopt a lower-risk approach, lower-risk fund(s) were recommended. " + text
+        if facts.get("risk_mismatch_acknowledged"):
+            text += " The mismatch and possible lower-return outcome were explained and acknowledged by the client."
+        paragraphs.append(text)
+    # Higher/unknown comparisons go to Needs Attention, not [REVIEW REQUIRED] in the PDF.
 
     if profile.death_benefit_text:
         paragraphs.append(profile.death_benefit_text)
@@ -999,10 +1232,6 @@ def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfi
             f"The proposed {'single' if affordability.get('budget_mode') == 'single' else 'annual'} amount of ${fmt_money(amount)} will be funded from {source}. "
             "Based on the disclosed funding base, the budget is below the 50% concentration threshold."
         )
-    elif amount and source:
-        paragraphs.append(f"The proposed amount is ${fmt_money(amount)} and the stated source of funds is {source}. [REVIEW REQUIRED] Confirm the <50% affordability/concentration test before submission.")
-    elif amount:
-        paragraphs.append(f"The proposed amount is ${fmt_money(amount)}. [REVIEW REQUIRED] Record the actual source of funds and verify affordability/concentration before submission.")
 
     if facts.get("investment_goal") and facts.get("investment_amount_to_plan"):
         existing = facts.get("investment_existing") or "0"
@@ -1013,25 +1242,41 @@ def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfi
 
     if facts.get("future_changes") is False:
         paragraphs.append("No material change in income, expenses, assets or liabilities within the next 12 months has been declared that is expected to affect affordability.")
-    elif facts.get("future_changes") is True:
-        reason = clean(facts.get("future_changes_reason"))
-        paragraphs.append("A material financial change within the next 12 months has been declared" + (f": {reason}." if reason else ". [REVIEW REQUIRED] Record the details and impact on affordability."))
+    elif facts.get("future_changes") is True and clean(facts.get("future_changes_reason")):
+        paragraphs.append(f"A material financial change within the next 12 months has been declared: {clean(facts.get('future_changes_reason'))}.")
 
-    # Keep BOR clean: remove accidental double spaces and empty paragraphs.
+    if objective:
+        strategy = "retirement strategy" if "retirement" in objective.lower() else "overall investment strategy"
+        paragraphs.append(f"This recommendation forms part of the client's {strategy}.")
+
     return "\n\n".join(clean(p) for p in paragraphs if clean(p))
 
-
 def page13_texts(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> dict[str, str]:
-    objective = _product_objective(data, facts, profile)
+    defaults = _page13_defaults(profile)
     return {
-        "objective": objective,
-        "time_horizon": clean(facts.get("investment_time_horizon")) or clean(data.get("policy_term")),
-        "features": profile.product_feature_text,
-        "limitations": profile.limitation_text,
+        "objective": _product_objective(data, facts, profile),
+        "time_horizon": clean(facts.get("investment_time_horizon")),
+        "features": clean(data.get("page13_features")) or defaults.get("features", ""),
+        "limitations": clean(data.get("page13_limitations")) or defaults.get("limitations", ""),
         "expected_return": clean(facts.get("expected_rate_of_return")),
-        "charges": clean(facts.get("sales_charges")) or profile.charges_text,
-        "investment_risk": clean(facts.get("investment_risk_text")) or ("Market / investment risk" if profile.category in {"ilp", "unit_trust"} else profile.limitation_text),
-        "other_limitations": clean(facts.get("other_product_limitations")) or profile.limitation_text,
+        "charges": clean(facts.get("sales_charges")) or defaults.get("charges", ""),
+        "investment_risk": clean(facts.get("investment_risk_text")) or defaults.get("investment_risk", ""),
+        "other_limitations": clean(facts.get("other_product_limitations")) or defaults.get("other_limitations", ""),
+    }
+
+def needs_attention_summary(checks: list[dict[str, str]]) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, str]]] = {"action_required": [], "please_review": [], "checked": []}
+    for item in checks:
+        level = clean(item.get("level")) or ("checked" if item.get("status") == "PASS" else "please_review")
+        if level not in groups:
+            level = "please_review"
+        groups[level].append(item)
+    attention_count = len(groups["action_required"]) + len(groups["please_review"])
+    return {
+        **groups,
+        "counts": {k: len(v) for k, v in groups.items()},
+        "attention_count": attention_count,
+        "headline": "No items need attention" if attention_count == 0 else f"{attention_count} item(s) need attention",
     }
 
 
@@ -1043,83 +1288,67 @@ def enrich_case(
 ) -> dict[str, Any]:
     """Enrich one extracted case without inventing unsupported client facts."""
     fields = fields or {}
-    profile = classify_product(data, product_type, source_text)
+    # Include actual form values in product classification. Some platform names (for
+    # example IFAST) can appear in Page-13 fields later than the first chunk of PDF text.
+    field_blob = " ".join(clean(v) for v in fields.values() if clean(v))
+    profile = classify_product(data, product_type, source_text + " " + field_blob)
     facts = extract_compliance_facts(data, fields, source_text)
     apply_product_fna(data, facts, profile)
     facts["affordability"] = affordability_assessment(data, facts, profile)
     facts["risk_comparison"] = risk_comparison(facts)
-    facts["priorities"] = facts.get("priorities_existing") or priority_selections(data, profile)
+
+    if facts.get("priorities_existing"):
+        facts["priorities"] = facts["priorities_existing"]
+        facts["priorities_source"] = "existing"
+    elif isinstance(data.get("priorities"), dict) and data.get("priorities"):
+        facts["priorities"] = priority_selections(data, profile)
+        facts["priorities_source"] = "explicit"
+    else:
+        facts["priorities"] = priority_selections(data, profile)
+        facts["priorities_source"] = "derived"
+
     facts["page13"] = page13_texts(data, facts, profile)
     facts["preflight"] = preflight_checks(data, facts, profile)
+    facts["needs_attention"] = needs_attention_summary(facts["preflight"])
 
-    # Promote safe facts to the case dict so the PDF mapper can consume them directly.
     promoted = (
-        "annual_income",
-        "annual_expenses",
-        "annual_surplus",
-        "personal_use_assets",
-        "investment_assets",
-        "cpf_total",
-        "other_assets",
-        "total_assets",
-        "loans",
-        "other_liabilities",
-        "total_liabilities",
-        "net_assets",
-        "financial_disclosure_note",
-        "financial_disclosure_partial",
-        "annual_budget",
-        "annual_budget_source",
-        "single_budget",
-        "single_budget_source",
-        "source_of_funds",
-        "investment_goal",
-        "investment_duration_years",
-        "investment_existing",
-        "investment_amount_to_plan",
-        "risk_return_preference",
-        "risk_taking_preference",
-        "risk_profile",
-        "fund_risk_profile",
-        "asset_class",
-        "expected_rate_of_return",
-        "sales_charges",
-        "investment_risk_text",
-        "other_product_limitations",
-        "investment_time_horizon",
-        "distribution_fund",
-        "is_joint_case",
-        "cka_education",
-        "cka_professional_qualification",
-        "cka_investment_experience",
-        "cka_work_experience",
-        "cka_met",
-        "selected_client",
-        "future_changes",
-        "future_changes_reason",
+        "annual_income", "annual_expenses", "annual_surplus", "personal_use_assets",
+        "investment_assets", "cpf_total", "other_assets", "total_assets", "loans",
+        "other_liabilities", "total_liabilities", "net_assets", "financial_disclosure_note",
+        "financial_disclosure_partial", "annual_budget", "annual_budget_source", "single_budget",
+        "single_budget_source", "source_of_funds", "investment_goal", "investment_duration_years",
+        "investment_existing", "investment_amount_to_plan", "risk_return_preference",
+        "risk_taking_preference", "risk_profile", "fund_risk_profile", "asset_class",
+        "expected_rate_of_return", "sales_charges", "investment_risk_text",
+        "other_product_limitations", "investment_time_horizon", "distribution_fund",
+        "is_joint_case", "cka_education", "cka_professional_qualification",
+        "cka_investment_experience", "cka_work_experience", "cka_met", "selected_client",
+        "future_changes", "future_changes_reason", "factsheet_presented", "lower_risk_preference",
+        "risk_mismatch_acknowledged",
     )
     for key in promoted:
         value = facts.get(key)
         if value not in (None, "", [], {}):
             data[key] = value
         elif isinstance(value, bool) or value is None:
-            # Preserve explicit booleans / unknown state for rule evaluation.
             data[key] = value
 
     data["funds"] = facts.get("funds") or []
     data["product_profile_key"] = profile.key
     data["product_category"] = profile.category
     data["insurer_name"] = clean(data.get("insurer_name")) or profile.company
-    data["premium_mode"] = profile.premium_mode
+    assessed_mode = clean((facts.get("affordability") or {}).get("budget_mode")).lower()
+    data["premium_mode"] = assessed_mode if assessed_mode in {"annual", "single"} else profile.premium_mode
     data["requires_cka"] = profile.requires_cka
     data["disclosure_checklist"] = profile.disclosure_checklist
     data["affordability"] = facts["affordability"]
     data["priorities"] = facts["priorities"]
+    data["priorities_source"] = facts["priorities_source"]
     data["page13"] = facts["page13"]
     data["preflight"] = facts["preflight"]
+    data["needs_attention"] = facts["needs_attention"]
     data["recommendation_text"] = build_bor(data, facts, profile)
     return data
-
 
 __all__ = [
     "PRODUCT_PROFILES",
@@ -1135,6 +1364,7 @@ __all__ = [
     "fmt_money",
     "money_number",
     "normalise_risk",
+    "needs_attention_summary",
     "preflight_checks",
     "priority_selections",
     "risk_comparison",

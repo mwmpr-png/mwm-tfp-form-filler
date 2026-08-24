@@ -40,6 +40,56 @@ async def save_upload(upload: UploadFile | None, dest: Path) -> Path | None:
     return path
 
 
+def _augment_needs_attention_with_runtime(data: dict, client_sig_path: Path | None, fa_sig_path: Path | None) -> dict:
+    """Add upload/runtime checks that the document extractor cannot know.
+
+    Missing signatures are shown on the result page rather than being invented or
+    silently stamped. The generated PDF remains editable so the adviser can complete
+    these items manually before submission.
+    """
+    review = data.get("needs_attention") if isinstance(data.get("needs_attention"), dict) else {}
+    groups = {
+        "action_required": list(review.get("action_required") or []),
+        "please_review": list(review.get("please_review") or []),
+        "checked": list(review.get("checked") or []),
+    }
+
+    def add(group: str, code: str, label: str, detail: str, page: str):
+        # Avoid duplicates when a case is re-rendered.
+        if any(item.get("code") == code for items in groups.values() for item in items if isinstance(item, dict)):
+            return
+        groups[group].append({
+            "code": code,
+            "label": label,
+            "status": "PASS" if group == "checked" else "REVIEW",
+            "detail": detail,
+            "page": page,
+            "level": group,
+        })
+
+    if client_sig_path and client_sig_path.exists():
+        add("checked", "client_signature_upload", "Client signature", "Client signature image was uploaded and applied to applicable client signature fields. Double-check placement before submission.", "Pages 8, 12, 15/16, 17 & 18")
+    else:
+        add("action_required", "client_signature_upload", "Client signature missing", "No client signature image was uploaded. Sign every applicable client acknowledgement/declaration in the editable TFP before submission.", "Pages 8, 12, 15/16, 17 & 18")
+
+    if fa_sig_path and fa_sig_path.exists():
+        add("checked", "fa_signature_upload", "FA signature", "FA signature image was uploaded and applied to applicable FA signature fields. Double-check placement before submission.", "Pages 18 & 20")
+    else:
+        add("action_required", "fa_signature_upload", "FA signature missing", "No FA signature image was uploaded. Complete the applicable FA Representative signatures in the editable TFP before submission.", "Pages 18 & 20")
+
+    # A joint case can never reuse the first client's signature for the joint client.
+    if data.get("is_joint_case"):
+        add("action_required", "joint_signature", "Joint-client signature", "Joint case detected. The first client's signature is not copied into the joint-client signature boxes; obtain the joint client's own signature where applicable.", "Pages 8, 15/16, 17 & 18")
+
+    groups["counts"] = {
+        "action_required": len(groups["action_required"]),
+        "please_review": len(groups["please_review"]),
+        "checked": len(groups["checked"]),
+    }
+    data["needs_attention"] = groups
+    return groups
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
@@ -75,6 +125,7 @@ async def generate(
     client_sig_path = await save_upload(client_signature, upload_dir)
 
     data = build_case(docs, adviser_email, product_type, expected_retirement_income)
+    needs_attention = _augment_needs_attention_with_runtime(data, client_sig_path, fa_sig_path)
     client = safe_name(data.get("client_name", "client"))
 
     # 1. TFP
@@ -129,6 +180,7 @@ async def generate(
         "audit_url": f"/download/{job_id}/{audit.name}",
         "zip_url": f"/download/{job_id}/{zip_path.name}",
         "data": data,
+        "needs_attention": needs_attention,
     })
 
 

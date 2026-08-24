@@ -340,6 +340,11 @@ def _bool_cb(cb: dict[str, str], true_name: str, false_name: str, value: bool | 
 
 
 def _priority_checkboxes(data: dict[str, Any], cb: dict[str, str]) -> None:
+    # Do not tick client priorities merely because a product was selected. When
+    # the engine had to derive tentative priorities, leave Page 5 blank and show
+    # the item in Needs Attention for adviser confirmation.
+    if str(data.get("priorities_source") or "").lower() == "derived":
+        return
     priorities = data.get("priorities") or {}
     if not isinstance(priorities, dict):
         return
@@ -391,8 +396,9 @@ def _fund_rows(data: dict[str, Any], profile, fields: dict[str, Any]) -> None:
         name = str(fund.get("name") or "").strip()
         asset = str(fund.get("asset_class") or "").strip()
         amount = str(fund.get("amount") or "").strip()
-        if not amount and idx == 1 and profile.category in {"ilp", "unit_trust"}:
-            # The product premium is the only safe amount fallback; never fabricate a 100% allocation.
+        if not amount and idx == 1 and len(funds) == 1 and profile.category in {"ilp", "unit_trust"}:
+            # For one selected fund, the transaction premium/investment amount is a safe fallback.
+            # With multiple funds, do not put the whole premium into fund 1 when the split is unknown.
             amount = str(data.get("premium") or "").strip()
         if profile.category == "unit_trust":
             fields[f"UT {idx}"] = "IFAST (UT)" if profile.key == "ifast_unit_trust" else "UT"
@@ -435,7 +441,9 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     # Premium from the insurer/platform document is a safe budget-amount fallback.  The funding
     # source still has to be supported by the uploaded data and is never invented.
     premium_mode = str(data.get("premium_mode") or profile.premium_mode or "").lower()
-    source_of_funds = data.get("source_of_funds", "") or data.get("source_of_income", "")
+    # Transaction source of funds is distinct from general source of income.
+    # Do not use occupation/income source as a funding-source fallback.
+    source_of_funds = data.get("source_of_funds", "")
     annual_budget_value = data.get("annual_budget", "")
     annual_budget_source = data.get("annual_budget_source", "")
     single_budget_value = data.get("single_budget", "")
@@ -488,6 +496,8 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "Text154": _money_text(single_budget_value, compact=True),
         "Text156": single_budget_source,
         "Text116": data.get("future_changes_reason", ""),
+        # Page 17 free-text Other Source (the approved references use this for CPF).
+        "undefined_72": "CPF" if "cpf" in str(data.get("source_of_funds") or "").lower() else data.get("other_source_of_funds", ""),
         # Common TFP assumptions retained from the approved reference templates.
         "Text3000": data.get("life_expectancy_assumption", "3"),
         "Text3111": data.get("inflation_assumption", "3"),
@@ -629,13 +639,14 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     elif profile.disclosure_checklist == "unit_trust":
         cb["Check Box43"] = "Check Box43"
 
-    # Source of funds declaration: tick only a supported category.
-    source = str(data.get("source_of_funds") or data.get("source_of_income") or "").lower()
+    # Source of funds declaration: use transaction funding source only.
+    # Multiple actual sources may be selected (e.g. Employment + Savings + CPF).
+    source = str(data.get("source_of_funds") or "").lower()
     if any(x in source for x in ("salary", "employment", "trade", "business income")):
         cb["Employment  Trade Income"] = "Employment  Trade Income"
-    elif "investment" in source or "dividend" in source:
+    if "investment" in source or "dividend" in source:
         cb["Investment Income"] = "Investment Income"
-    elif any(x in source for x in ("saving", "cash", "asset", "cpf")):
+    if any(x in source for x in ("saving", "cash", "asset", "cpf")):
         cb["Savings"] = "Savings"
 
     return {k: v for k, v in fields.items() if v is not None and str(v) != ""}, cb

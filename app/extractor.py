@@ -581,8 +581,27 @@ def extract_client(text: str, fields: dict[str, str], adviser_email: str = "") -
         else "Full-Time" if fields.get("FullTime") or fields.get("Full-Time")
         else ""
     )
-    # No SAVINGS default.  Source of funds/income must be present in a source document.
-    data["source_of_income"] = first_field(fields, "income_source", "if retired  unemployed", "Source of Funds", "Text152", "Text156")
+    # Keep source of income and transaction source of funds separate.  One must
+    # never be silently substituted for the other.
+    data["source_of_income"] = first_field(fields, "income_source", "if retired  unemployed")
+
+    funding_sources: list[str] = []
+    direct_source = first_field(fields, "Source of Funds", "Text152", "Text156")
+    if direct_source:
+        funding_sources.append(direct_source)
+    if first_field(fields, "Employment  Trade Income", "Employment Trade Income"):
+        funding_sources.append("Employment / Trade Income")
+    if first_field(fields, "Investment Income"):
+        funding_sources.append("Investment Income")
+    if first_field(fields, "Savings"):
+        funding_sources.append("Savings")
+    other_source = first_field(fields, "undefined_72")
+    if other_source:
+        funding_sources.append(other_source)
+    # Preserve order while removing duplicates.
+    if funding_sources:
+        data["source_of_funds"] = " & ".join(dict.fromkeys(funding_sources))
+
     data["education"] = first_field(fields, "highest_education_level", "Highest Education Level")
     data["english"] = "Yes" if fields.get("checkbox_english_yes") or fields.get("yes1") else ""
 
