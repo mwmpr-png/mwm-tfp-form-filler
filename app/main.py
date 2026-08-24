@@ -46,10 +46,11 @@ def _augment_needs_attention_with_runtime(
     fa_sig_path: Path | None,
     signature_plan: dict | None = None,
 ) -> dict:
-    """Add runtime signature checks that report actual page eligibility.
+    """Add runtime signature checks to Needs Attention.
 
-    An uploaded image is not described as "applied" to pages whose declarations
-    are incomplete. Those pages are explicitly reported as held back.
+    Uploaded client/FA signatures are stamped on all applicable TFP signature
+    fields even when other declarations are incomplete. Those incomplete items
+    remain listed separately for the adviser to complete in the editable TFP.
     """
     review = data.get("needs_attention") if isinstance(data.get("needs_attention"), dict) else {}
     groups = {
@@ -69,33 +70,29 @@ def _augment_needs_attention_with_runtime(
 
     plan = signature_plan or tfp_signature_plan(data)
     client_apply = plan.get("client_apply", [])
-    client_hold = plan.get("client_hold", [])
     fa_apply = plan.get("fa_apply", [])
-    fa_hold = plan.get("fa_hold", [])
 
     if client_sig_path and client_sig_path.exists():
-        if client_apply:
-            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply if item.get("page")))
-            add("checked", "client_signature_applied", "Client signature", f"Client signature image will be applied only to currently eligible TFP pages: {pages}.", pages)
-        if client_hold:
-            detail = "; ".join(f"{item.get('page')}: {item.get('reason')}" for item in client_hold)
-            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_hold if item.get("page")))
-            add("action_required", "client_signature_held", "Client signature held back", "The uploaded client signature is not stamped onto incomplete declarations. " + detail + ".", pages)
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply if item.get("page")))
+        add(
+            "checked", "client_signature_applied", "Client signature",
+            f"Client signature image is stamped on all applicable client signature fields: {pages}. Any incomplete declarations remain listed above for adviser completion in the editable TFP.",
+            pages,
+        )
     else:
-        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply + client_hold if item.get("page")))
-        add("action_required", "client_signature_upload", "Client signature missing", "No client signature image was uploaded. Sign the applicable client declarations after the underlying information is complete.", pages or "Applicable TFP pages")
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply if item.get("page")))
+        add("action_required", "client_signature_upload", "Client signature missing", "No client signature image was uploaded. Applicable client signature fields remain blank.", pages or "Applicable TFP pages")
 
     if fa_sig_path and fa_sig_path.exists():
-        if fa_apply:
-            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply if item.get("page")))
-            add("checked", "fa_signature_applied", "FA signature", f"FA signature image will be applied only to currently eligible TFP pages: {pages}.", pages)
-        if fa_hold:
-            detail = "; ".join(f"{item.get('page')}: {item.get('reason')}" for item in fa_hold)
-            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_hold if item.get("page")))
-            add("action_required", "fa_signature_held", "FA signature held back", "The uploaded FA signature is not stamped onto incomplete declarations. " + detail + ".", pages)
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply if item.get("page")))
+        add(
+            "checked", "fa_signature_applied", "FA signature",
+            f"FA signature image is stamped on all applicable FA Representative signature fields: {pages}. Any incomplete declarations remain listed above for adviser completion in the editable TFP.",
+            pages,
+        )
     else:
-        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply + fa_hold if item.get("page")))
-        add("action_required", "fa_signature_upload", "FA signature missing", "No FA signature image was uploaded. Complete the applicable FA Representative signatures after the declarations are ready.", pages or "Pages 18 & 20")
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply if item.get("page")))
+        add("action_required", "fa_signature_upload", "FA signature missing", "No FA signature image was uploaded. Applicable FA Representative signature fields remain blank.", pages or "Pages 18 & 20")
 
     if data.get("is_joint_case"):
         add("action_required", "joint_signature", "Joint-client signature", "Joint case detected. The first client's signature is not copied into joint-client signature boxes; obtain the joint client's own signature where applicable.", "Pages 8, 15/16, 17 & 18")

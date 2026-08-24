@@ -1272,7 +1272,7 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
         add("disclosure_route", "Disclosure checklist route", "REVIEW", "The applicable disclosure checklist could not be determined from the product classification.", "Pages 15-16", "action_required")
     if profile.disclosure_checklist in {"life", "unit_trust"} and not facts.get("disclosure_confirmed"):
         page = "Page 15" if profile.disclosure_checklist == "life" else "Page 16"
-        add("disclosure_ack", "Disclosure acknowledgement", "REVIEW", "Confirm that the applicable disclosure documents/information were provided and explained before ticking/signing the checklist acknowledgement.", page, "action_required")
+        add("disclosure_ack", "Disclosure acknowledgement", "REVIEW", "Confirm that the applicable disclosure documents/information were provided and explained, and complete the checklist acknowledgement before submission.", page, "action_required")
 
     # Page 17: source is handled together with Page 8 above; separately require
     # the payer, sole-interest and political-exposure declarations.
@@ -1289,8 +1289,9 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
     else:
         add("affordability_ack", "Client affordability acknowledgement", "REVIEW", "Complete the Page-18 Yes/No acknowledgement on whether the premium/investment is affordable and comfortable.", "Page 18", "action_required")
 
-    # Page 18-20 remain human acknowledgements/declarations. Runtime signature
-    # checks report exactly which signatures were applied or deliberately held back.
+    # Page 18-20 remain human acknowledgements/declarations. Uploaded signature
+    # images may already be stamped; unresolved acknowledgements still remain
+    # visible for adviser completion before submission.
     add("acknowledgements", "Client / FA acknowledgements", "REVIEW", "Review the Page 18 client authorization, Page 19 supervisor suitability items and Page 20 FA declaration before submission; these are not inferred from the product selected.", "Pages 18-20", "please_review")
     priorities_source = clean(facts.get("priorities_source"))
     if priorities_source in {"existing", "explicit"}:

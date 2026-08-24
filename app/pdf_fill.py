@@ -275,11 +275,15 @@ def _insert_signature_at_widget(doc: fitz.Document, field_name: str, img: Path |
 
 
 def tfp_signature_plan(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
-    """Return page-specific TFP signature eligibility.
+    """Return all applicable TFP signature fields for the current transaction.
 
-    Uploaded signature images are not treated as blanket permission to sign an
-    incomplete declaration. Each page is eligible only when its material Yes/No
-    or acknowledgement inputs are supported.
+    If a client or FA signature image is uploaded, it is stamped on every
+    applicable signature field in the generated editable TFP. Missing or
+    incomplete declarations remain visible in Needs Attention for the adviser
+    to complete after generation; they do not suppress signature placement.
+
+    The first client's signature is never copied into joint-client signature
+    fields. Joint clients require their own signature.
     """
     profile = classify_product(data, str(data.get("product_type") or ""))
     plan = {"client_apply": [], "client_hold": [], "fa_apply": [], "fa_hold": []}
@@ -287,82 +291,27 @@ def tfp_signature_plan(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
     def apply(who: str, field: str, page: str, label: str):
         plan[f"{who}_apply"].append({"field": field, "page": page, "label": label})
 
-    def hold(who: str, page: str, label: str, reason: str):
-        plan[f"{who}_hold"].append({"page": page, "label": label, "reason": reason})
+    # Client signature pages that apply to the TFP generally.
+    apply("client", "Signature19", "Page 8", "Financial Profile")
 
-    # Page 8 financial-profile signature.
-    p8_complete = (
-        isinstance(data.get("cashflow_included"), bool)
-        and isinstance(data.get("assets_liabilities_included"), bool)
-        and bool(str(data.get("source_of_funds") or "").strip())
-        and isinstance((data.get("affordability") or {}).get("budget_substantial"), bool)
-        and isinstance(data.get("future_changes"), bool)
-    )
-    if p8_complete:
-        apply("client", "Signature19", "Page 8", "Financial Profile")
-    else:
-        hold("client", "Page 8", "Financial Profile", "financial-profile/funding declarations are incomplete")
-
-    # Page 12 CKA acknowledgement requires both an outcome and the actual advice/
-    # suitability acknowledgement path; outcome alone is not enough to sign.
+    # CKA acknowledgement applies to SIP transactions (ILP / Unit Trust).
     if profile.requires_cka:
-        acks = set(data.get("cka_acknowledgements") or [])
-        if not acks and str(data.get("cka_acknowledgement") or "").strip():
-            acks.add(str(data.get("cka_acknowledgement")).strip())
-        if data.get("cka_met") is True:
-            complete = ("pass_no_advice" in acks) or ("pass_advice" in acks and bool({"pass_suitable", "pass_not_suitable"} & acks))
-        elif data.get("cka_met") is False:
-            complete = "fail_proceed" in acks and bool({"fail_suitable", "fail_not_suitable"} & acks)
-        else:
-            complete = False
-        if complete:
-            apply("client", "Signature36", "Page 12", "CKA acknowledgement")
-        else:
-            hold("client", "Page 12", "CKA acknowledgement", "CKA outcome/acknowledgement path is incomplete")
+        apply("client", "Signature36", "Page 12", "CKA acknowledgement")
 
-    # Pages 15/16 disclosure acknowledgement is a client declaration and is not
-    # auto-ticked merely because that checklist page applies.
+    # Only the transaction-appropriate disclosure checklist is signed.
     if profile.disclosure_checklist == "life":
-        if data.get("disclosure_confirmed") is True:
-            apply("client", "Signature2", "Page 15", "Life / ILP disclosure checklist")
-        else:
-            hold("client", "Page 15", "Life / ILP disclosure checklist", "disclosure acknowledgement is not confirmed")
+        apply("client", "Signature2", "Page 15", "Life / ILP disclosure checklist")
     elif profile.disclosure_checklist == "unit_trust":
-        if data.get("disclosure_confirmed") is True:
-            apply("client", "Signature4", "Page 16", "Unit Trust disclosure checklist")
-        else:
-            hold("client", "Page 16", "Unit Trust disclosure checklist", "disclosure acknowledgement is not confirmed")
+        apply("client", "Signature4", "Page 16", "Unit Trust disclosure checklist")
 
-    # Page 17 AML/CFT declaration.
-    aml_answers = (data.get("payer_is_client"), data.get("sole_interest"), data.get("pep_self"), data.get("pep_family"), data.get("pep_associate"))
-    aml_complete = all(isinstance(v, bool) for v in aml_answers)
-    if data.get("payer_is_client") is True and not str(data.get("source_of_funds") or "").strip():
-        aml_complete = False
-    if aml_complete:
-        apply("client", "Signature184", "Page 17", "AML / CFT declaration")
-    else:
-        hold("client", "Page 17", "AML / CFT declaration", "payer/source/sole-interest/PEP declarations are incomplete")
+    apply("client", "Signature184", "Page 17", "Client declaration")
+    apply("client", "Clients Signature", "Page 18", "Client acknowledgement")
 
-    # Page 18 is the client's final authorisation to act on the recommendation.
-    # Do not pre-stamp it while blocking compliance items remain unresolved.
-    action_count = int(((data.get("needs_attention") or {}).get("counts") or {}).get("action_required") or 0)
-    if isinstance(data.get("affordability_comfortable"), bool) and action_count == 0:
-        apply("client", "Clients Signature", "Page 18", "Client acknowledgement")
-        apply("fa", "FA Representatives Signature", "Page 18", "FA Representative declaration")
-    else:
-        reason = "affordability/concentration acknowledgement is incomplete" if not isinstance(data.get("affordability_comfortable"), bool) else f"{action_count} Action Required item(s) remain unresolved"
-        hold("client", "Page 18", "Client acknowledgement", reason)
-        hold("fa", "Page 18", "FA Representative declaration", reason)
-
-    # Page 20 FA declaration is a completion declaration. Hold it while any
-    # blocking compliance item remains unresolved.
-    if action_count == 0:
-        apply("fa", "Signature191", "Page 20", "FA Representative declaration")
-    else:
-        hold("fa", "Page 20", "FA Representative declaration", f"{action_count} Action Required item(s) remain unresolved")
+    # FA signatures remain independent of unresolved Needs Attention items.
+    apply("fa", "FA Representatives Signature", "Page 18", "FA Representative declaration")
+    apply("fa", "Signature191", "Page 20", "FA Representative declaration")
 
     return plan
-
 
 def stamp_signatures(
     pdf_path: Path,
@@ -373,10 +322,11 @@ def stamp_signatures(
     data: dict[str, Any] | None = None,
     signature_plan: dict[str, list[dict[str, str]]] | None = None,
 ) -> Path:
-    """Stamp signatures into the form's actual signature widgets where available.
+    """Stamp uploaded signatures into all applicable TFP signature widgets.
 
-    The same client signature is deliberately NOT copied into joint-client signature slots. A joint
-    case needs a separate joint signature/CKA and is flagged by the compliance preflight.
+    Incomplete fields/declarations remain editable and are surfaced separately in
+    Needs Attention. The first client's signature is deliberately NOT copied into
+    joint-client signature slots.
     """
     shutil.copyfile(pdf_path, output)
     doc = fitz.open(str(output))
@@ -651,8 +601,8 @@ def tfp_field_map(
         "date": data.get("next_review_date") or next_review_ddmmyyyy(),
     }
 
-    # Dates are populated only where an uploaded signature is actually eligible
-    # to be stamped on that page.
+    # When a signature image is uploaded, populate the date beside every
+    # applicable signature field that will be stamped.
     sig_plan = signature_plan or tfp_signature_plan(data)
     if client_signature_uploaded:
         client_pages = {item.get("page") for item in sig_plan.get("client_apply", [])}
