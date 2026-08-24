@@ -102,6 +102,84 @@ def _augment_needs_attention_with_runtime(
     return groups
 
 
+_ACTION_DISPLAY_SECTIONS = [
+    ("fa_authorisation", "Page 3 — FA authorisation", {"fa_authorisation"},
+     "Confirm the FA Representative's applicable product-authorisation category."),
+    ("client_profile", "Pages 4–5 — Client profile & priorities", {"selected_client", "priorities"},
+     "Confirm Selected Client status and the client's actual Page-5 personal priorities."),
+    ("portfolio_health", "Pages 6–7 — Dependants, portfolios & health", {"dependants", "insurance_portfolio", "investment_portfolio", "health_declaration"},
+     "Confirm dependant inclusion, existing insurance/investment portfolio choices and the Page-7 health declaration."),
+    ("financial_profile", "Pages 8, 18 & 19 — Financial profile & affordability", {"cashflow", "assets_liabilities", "budget", "funding_source", "affordability_basis", "supervisor_affordability", "supervisor_concentration", "affordability_ack"},
+     "Complete or confirm cash flow, assets/liabilities, transaction source of funds and the affordability/concentration basis. Do not assume zero liabilities or substitute the client's general source of income."),
+    ("fna", "Page 9 — Financial Needs Analysis", {"fna"},
+     "Complete any missing FNA inputs needed to reconcile the client's target, existing resources and amount to plan for."),
+    ("investment_suitability", "Pages 10, 13–14 — Investment suitability", {"risk_profile", "time_horizon", "asset_class", "fund_risk", "lower_risk_rationale", "risk_ack", "factsheet", "objective", "expected_return"},
+     "Confirm the client's risk profile and time horizon, plus applicable fund factsheet/asset-class/risk information, objective and expected return. Do not copy unsupported values from a reference case."),
+    ("cka", "Pages 11–12 — CKA", {"cka", "joint_cka"},
+     "Complete the qualifying CKA criteria, outcome and acknowledgement path; complete a separate CKA for another relevant client/account holder where applicable."),
+    ("business_trail", "Page 13 — Business Trail", {"business_trail"},
+     "Complete client source, prospecting method, advisory-session location and Face-to-Face/Non-Face-to-Face details."),
+    ("disclosure_aml", "Pages 15–17 — Disclosure & AML", {"disclosure_route", "disclosure_ack", "aml_declarations"},
+     "Complete the applicable disclosure acknowledgement and the Page-17 payer, source-of-funds, sole-interest and political-exposure declarations."),
+    ("signatures", "Signatures", {"client_signature_upload", "fa_signature_upload", "joint_signature"},
+     "Complete any missing client, FA or joint-client signature requirements."),
+]
+
+
+def _needs_attention_for_display(review: dict) -> dict:
+    """Group low-level compliance checks into adviser-friendly action areas.
+
+    The extraction audit keeps every individual check.  Only the result-page
+    presentation is condensed so advisers see a short, useful list instead of
+    twenty-plus repetitive cards.
+    """
+    if not isinstance(review, dict):
+        return {"action_required": [], "please_review": [], "checked": [], "counts": {"action_required": 0, "please_review": 0, "checked": 0}}
+
+    action_items = [x for x in (review.get("action_required") or []) if isinstance(x, dict)]
+    used: set[int] = set()
+    grouped: list[dict] = []
+
+    for section_code, label, codes, detail in _ACTION_DISPLAY_SECTIONS:
+        matches = [(idx, item) for idx, item in enumerate(action_items) if item.get("code") in codes]
+        if not matches:
+            continue
+        used.update(idx for idx, _ in matches)
+        pages: list[str] = []
+        for _, item in matches:
+            page = str(item.get("page") or "").strip()
+            if page and page not in pages:
+                pages.append(page)
+        grouped.append({
+            "code": f"display_{section_code}",
+            "label": label,
+            "status": "REVIEW",
+            "detail": detail,
+            "page": "; ".join(pages),
+            "level": "action_required",
+            "check_count": len(matches),
+        })
+
+    # Preserve any future/unmapped checks rather than accidentally hiding them.
+    for idx, item in enumerate(action_items):
+        if idx not in used:
+            grouped.append(dict(item))
+
+    please_review = [dict(x) for x in (review.get("please_review") or []) if isinstance(x, dict)]
+    checked = [dict(x) for x in (review.get("checked") or []) if isinstance(x, dict)]
+    return {
+        "action_required": grouped,
+        "please_review": please_review,
+        "checked": checked,
+        "counts": {
+            "action_required": len(grouped),
+            "please_review": len(please_review),
+            "checked": len(checked),
+        },
+        "raw_counts": dict(review.get("counts") or {}),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html", context={})
@@ -197,7 +275,7 @@ async def generate(
         "audit_url": f"/download/{job_id}/{audit.name}",
         "zip_url": f"/download/{job_id}/{zip_path.name}",
         "data": data,
-        "needs_attention": needs_attention,
+        "needs_attention": _needs_attention_for_display(needs_attention),
     })
 
 

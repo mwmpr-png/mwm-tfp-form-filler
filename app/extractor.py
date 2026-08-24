@@ -23,6 +23,24 @@ def clean(s: Any) -> str:
     return s.strip()
 
 
+def normalise_address_and_postal(address: Any, postal: Any = "") -> tuple[str, str]:
+    """Keep a Singapore postal code in the dedicated postal field, not twice.
+
+    ID extraction often returns an address ending in ``SINGAPORE 123456`` while
+    also returning ``123456`` separately.  The TFP has its own Postal Code field,
+    so remove only the trailing duplicate six-digit code from the address line.
+    """
+    addr = clean(address)
+    pc = clean(postal)
+    if not pc:
+        m = re.search(r"(?:\bSINGAPORE\s+)?(\d{6})\s*$", addr, flags=re.I)
+        if m:
+            pc = m.group(1)
+    if pc and addr:
+        addr = re.sub(rf"\s+{re.escape(pc)}\s*$", "", addr).strip()
+    return addr, pc
+
+
 def norm_money(s: Any) -> str:
     s = clean(s)
     if not s:
@@ -690,6 +708,14 @@ def build_case(paths: list[Path], adviser_email: str, product_type: str, expecte
             data[key] = val
     if data.get("dob") and not data.get("age_next"):
         data["age_next"] = age_next_birthday(data["dob"])
+
+    # The ID may contain the six-digit postal code at the end of the residential
+    # address and also in a dedicated postal field. Keep it only once in the TFP.
+    if data.get("residential_address"):
+        addr, pc = normalise_address_and_postal(data.get("residential_address"), data.get("postal"))
+        data["residential_address"] = addr
+        if pc:
+            data["postal"] = pc
 
     data["product_type"] = product_type
     data["expected_retirement_income"] = expected_retirement_income

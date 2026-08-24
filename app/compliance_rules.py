@@ -154,7 +154,7 @@ PRODUCT_PROFILES: dict[str, ProductProfile] = {
             "or account value, less any amount owing to the insurer, subject to the Product Summary."
         ),
         product_feature_text=(
-            "A regular-premium investment-linked plan providing investment opportunities together with insurance protection."
+            "A whole-life, regular-premium investment-linked plan (ILP) providing investment opportunities together with insurance protection."
         ),
         limitation_text=(
             "Surrender and partial-withdrawal charges may apply during the first 10 policy years. "
@@ -1391,6 +1391,27 @@ def _product_objective(data: dict[str, Any], facts: dict[str, Any], profile: Pro
         return "Retirement planning / wealth accumulation"
     return ""
 
+def _display_plan_name(data: dict[str, Any], profile: ProductProfile) -> str:
+    """Return the most specific supported product/variant name for narrative use."""
+    plan = clean(data.get("plan_name")) or profile.label
+    if profile.key == "ilp_10_flex_3" and plan and "10 flex" not in plan.lower():
+        plan = f"{plan} 10 Flexi 3"
+    return clean(plan)
+
+
+def _proposed_amount_sentence(amount: float, budget_mode: str, profile: ProductProfile) -> str:
+    if not amount:
+        return ""
+    mode = clean(budget_mode).lower()
+    if profile.category == "unit_trust":
+        noun = "regular savings amount" if mode == "annual" else "lump-sum investment amount" if mode == "single" else "investment amount"
+    elif profile.category in {"ilp", "life", "participating_life"}:
+        noun = "annual premium" if mode == "annual" else "single premium" if mode == "single" else "premium"
+    else:
+        noun = "amount"
+    return f"The proposed {noun} is ${fmt_money(amount)}."
+
+
 def _fund_sentence(facts: dict[str, Any], profile: ProductProfile) -> str:
     funds = facts.get("funds") or []
     if not funds:
@@ -1408,27 +1429,35 @@ def _fund_sentence(facts: dict[str, Any], profile: ProductProfile) -> str:
 
 
 def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> str:
-    """Build a clean Page-14 BOR without in-document review markers."""
+    """Build a clean Page-14 BOR without in-document review markers.
+
+    Use every supported client/product fact we already know, while leaving
+    unsupported suitability facts to Needs Attention instead of inventing them.
+    """
     age = clean(data.get("age_next") or data.get("age_last_birthday"))
-    age_text = f" (ANB age {age})" if age else ""
-    plan = clean(data.get("plan_name")) or profile.label
+    age_text = f" (ANB {age})" if age else ""
+    plan = _display_plan_name(data, profile)
     objective = _product_objective(data, facts, profile)
+    affordability = facts.get("affordability") or {}
+    amount = affordability.get("budget_amount") or 0
+    budget_mode = clean(affordability.get("budget_mode")) or clean(profile.premium_mode)
     paragraphs: list[str] = []
 
     if objective:
         objective_sentence = objective.strip().rstrip(" .;:")
-        # Preserve the adviser/client wording instead of forcing it into a
-        # grammatical construction such as "objective of client looking...".
         paragraphs.append(f"Client{age_text} stated the following objective: {objective_sentence}.")
 
     if plan:
-        if profile.category == "unit_trust":
-            prefix = f"{plan} / the selected investment is recommended"
-        else:
-            prefix = f"{plan} is recommended" if objective else f"The recommended product is {plan}."
         if objective:
-            prefix += " for the stated objective."
-        paragraphs.append(f"{prefix} {profile.product_feature_text}".strip())
+            if profile.category == "unit_trust":
+                intro = f"{plan} / the selected investment is recommended for the stated objective."
+            else:
+                intro = f"{plan} is recommended for the stated objective."
+        else:
+            intro = f"Client{age_text} is considering {plan}."
+        amount_sentence = _proposed_amount_sentence(amount, budget_mode, profile)
+        feature = clean(profile.product_feature_text)
+        paragraphs.append(" ".join(x for x in (intro, amount_sentence, feature) if x).strip())
 
     fund_sentence = _fund_sentence(facts, profile)
     if fund_sentence:
@@ -1463,12 +1492,10 @@ def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfi
     elif profile.category == "participating_life":
         paragraphs.append("Guaranteed and non-guaranteed benefits, participating-fund performance and surrender values should be read together with the Policy Illustration and Product Summary.")
 
-    affordability = facts.get("affordability") or {}
-    amount = affordability.get("budget_amount") or 0
     source = clean(affordability.get("budget_source"))
     if amount and source and affordability.get("budget_substantial") is False:
         paragraphs.append(
-            f"The proposed {'single' if affordability.get('budget_mode') == 'single' else 'annual'} amount of ${fmt_money(amount)} will be funded from {source}. "
+            f"The proposed amount will be funded from {source}. "
             "Based on the disclosed funding base, the budget is below the 50% concentration threshold."
         )
 
@@ -1489,6 +1516,7 @@ def build_bor(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfi
         paragraphs.append(f"This recommendation forms part of the client's {strategy}.")
 
     return "\n\n".join(clean(p) for p in paragraphs if clean(p))
+
 
 def page13_texts(data: dict[str, Any], facts: dict[str, Any], profile: ProductProfile) -> dict[str, str]:
     defaults = _page13_defaults(profile)
