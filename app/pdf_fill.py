@@ -33,6 +33,21 @@ def today_ddmmyyyy() -> str:
     return date.today().strftime("%d/%m/%Y")
 
 
+def next_review_ddmmyyyy() -> str:
+    """Default the next periodic review to one year after generation.
+
+    The TFP itself states that reviews are normally annual and the approved
+    completed examples use the same-date-next-year pattern. The field remains
+    editable so the adviser can change it where a different review date applies.
+    """
+    today = date.today()
+    try:
+        nxt = today.replace(year=today.year + 1)
+    except ValueError:  # 29 Feb -> 28 Feb in a non-leap year
+        nxt = today.replace(year=today.year + 1, day=28)
+    return nxt.strftime("%d/%m/%Y")
+
+
 def today_human() -> str:
     # %-d is supported on Railway/Linux. Keep a portable fallback for Windows dev machines.
     try:
@@ -259,12 +274,104 @@ def _insert_signature_at_widget(doc: fitz.Document, field_name: str, img: Path |
     return inserted
 
 
+def tfp_signature_plan(data: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    """Return page-specific TFP signature eligibility.
+
+    Uploaded signature images are not treated as blanket permission to sign an
+    incomplete declaration. Each page is eligible only when its material Yes/No
+    or acknowledgement inputs are supported.
+    """
+    profile = classify_product(data, str(data.get("product_type") or ""))
+    plan = {"client_apply": [], "client_hold": [], "fa_apply": [], "fa_hold": []}
+
+    def apply(who: str, field: str, page: str, label: str):
+        plan[f"{who}_apply"].append({"field": field, "page": page, "label": label})
+
+    def hold(who: str, page: str, label: str, reason: str):
+        plan[f"{who}_hold"].append({"page": page, "label": label, "reason": reason})
+
+    # Page 8 financial-profile signature.
+    p8_complete = (
+        isinstance(data.get("cashflow_included"), bool)
+        and isinstance(data.get("assets_liabilities_included"), bool)
+        and bool(str(data.get("source_of_funds") or "").strip())
+        and isinstance((data.get("affordability") or {}).get("budget_substantial"), bool)
+        and isinstance(data.get("future_changes"), bool)
+    )
+    if p8_complete:
+        apply("client", "Signature19", "Page 8", "Financial Profile")
+    else:
+        hold("client", "Page 8", "Financial Profile", "financial-profile/funding declarations are incomplete")
+
+    # Page 12 CKA acknowledgement requires both an outcome and the actual advice/
+    # suitability acknowledgement path; outcome alone is not enough to sign.
+    if profile.requires_cka:
+        acks = set(data.get("cka_acknowledgements") or [])
+        if not acks and str(data.get("cka_acknowledgement") or "").strip():
+            acks.add(str(data.get("cka_acknowledgement")).strip())
+        if data.get("cka_met") is True:
+            complete = ("pass_no_advice" in acks) or ("pass_advice" in acks and bool({"pass_suitable", "pass_not_suitable"} & acks))
+        elif data.get("cka_met") is False:
+            complete = "fail_proceed" in acks and bool({"fail_suitable", "fail_not_suitable"} & acks)
+        else:
+            complete = False
+        if complete:
+            apply("client", "Signature36", "Page 12", "CKA acknowledgement")
+        else:
+            hold("client", "Page 12", "CKA acknowledgement", "CKA outcome/acknowledgement path is incomplete")
+
+    # Pages 15/16 disclosure acknowledgement is a client declaration and is not
+    # auto-ticked merely because that checklist page applies.
+    if profile.disclosure_checklist == "life":
+        if data.get("disclosure_confirmed") is True:
+            apply("client", "Signature2", "Page 15", "Life / ILP disclosure checklist")
+        else:
+            hold("client", "Page 15", "Life / ILP disclosure checklist", "disclosure acknowledgement is not confirmed")
+    elif profile.disclosure_checklist == "unit_trust":
+        if data.get("disclosure_confirmed") is True:
+            apply("client", "Signature4", "Page 16", "Unit Trust disclosure checklist")
+        else:
+            hold("client", "Page 16", "Unit Trust disclosure checklist", "disclosure acknowledgement is not confirmed")
+
+    # Page 17 AML/CFT declaration.
+    aml_answers = (data.get("payer_is_client"), data.get("sole_interest"), data.get("pep_self"), data.get("pep_family"), data.get("pep_associate"))
+    aml_complete = all(isinstance(v, bool) for v in aml_answers)
+    if data.get("payer_is_client") is True and not str(data.get("source_of_funds") or "").strip():
+        aml_complete = False
+    if aml_complete:
+        apply("client", "Signature184", "Page 17", "AML / CFT declaration")
+    else:
+        hold("client", "Page 17", "AML / CFT declaration", "payer/source/sole-interest/PEP declarations are incomplete")
+
+    # Page 18 is the client's final authorisation to act on the recommendation.
+    # Do not pre-stamp it while blocking compliance items remain unresolved.
+    action_count = int(((data.get("needs_attention") or {}).get("counts") or {}).get("action_required") or 0)
+    if isinstance(data.get("affordability_comfortable"), bool) and action_count == 0:
+        apply("client", "Clients Signature", "Page 18", "Client acknowledgement")
+        apply("fa", "FA Representatives Signature", "Page 18", "FA Representative declaration")
+    else:
+        reason = "affordability/concentration acknowledgement is incomplete" if not isinstance(data.get("affordability_comfortable"), bool) else f"{action_count} Action Required item(s) remain unresolved"
+        hold("client", "Page 18", "Client acknowledgement", reason)
+        hold("fa", "Page 18", "FA Representative declaration", reason)
+
+    # Page 20 FA declaration is a completion declaration. Hold it while any
+    # blocking compliance item remains unresolved.
+    if action_count == 0:
+        apply("fa", "Signature191", "Page 20", "FA Representative declaration")
+    else:
+        hold("fa", "Page 20", "FA Representative declaration", f"{action_count} Action Required item(s) remain unresolved")
+
+    return plan
+
+
 def stamp_signatures(
     pdf_path: Path,
     output: Path,
     client_sig: Path | None = None,
     fa_sig: Path | None = None,
     kind: str = "tfp",
+    data: dict[str, Any] | None = None,
+    signature_plan: dict[str, list[dict[str, str]]] | None = None,
 ) -> Path:
     """Stamp signatures into the form's actual signature widgets where available.
 
@@ -277,25 +384,13 @@ def stamp_signatures(
     f_sig = _clean_image(fa_sig) if fa_sig else None
 
     if kind == "tfp":
-        checked = _checked_names(doc)
-
-        # Core client acknowledgements/declarations.
-        for name in ("Signature19", "Signature184", "Clients Signature"):
-            _insert_signature_at_widget(doc, name, c_sig)
-
-        # CKA signature only when a deterministic CKA outcome is actually filled.
-        if "Yes7" in checked or "No7" in checked:
-            _insert_signature_at_widget(doc, "Signature36", c_sig)
-
-        # Use the applicable disclosure checklist only.
-        if "Check Box42" in checked:
-            _insert_signature_at_widget(doc, "Signature2", c_sig)
-        if "Check Box43" in checked:
-            _insert_signature_at_widget(doc, "Signature4", c_sig)
-
-        # Adviser declarations / acknowledgement.
-        for name in ("FA Representatives Signature", "Signature191"):
-            _insert_signature_at_widget(doc, name, f_sig)
+        plan = signature_plan or tfp_signature_plan(data or {})
+        if c_sig and c_sig.exists():
+            for item in plan.get("client_apply", []):
+                _insert_signature_at_widget(doc, item.get("field", ""), c_sig)
+        if f_sig and f_sig.exists():
+            for item in plan.get("fa_apply", []):
+                _insert_signature_at_widget(doc, item.get("field", ""), f_sig)
     elif kind == "checklist":
         # External checklist templates supplied previously do not consistently expose a signature widget.
         if f_sig and f_sig.exists() and len(doc):
@@ -390,6 +485,15 @@ def _fund_rows(data: dict[str, Any], profile, fields: dict[str, Any]) -> None:
             "amount": data.get("fund_invested_amount", ""),
         }]
 
+    # Even when the selected fund/factsheet is still missing, Page 13 can safely
+    # show the known transaction category and amount. Do not leave the entire
+    # Investment Products row empty simply because fund-specific facts are pending.
+    if not funds and profile.category in {"ilp", "unit_trust"}:
+        fields["UT 1"] = "IFAST (UT)" if profile.key == "ifast_unit_trust" else ("UT" if profile.category == "unit_trust" else "ILP")
+        if str(data.get("premium") or "").strip():
+            fields["RSP 1"] = _money_text(data.get("premium"), compact=False)
+        return
+
     for idx, fund in enumerate(funds[:7], start=1):
         if not isinstance(fund, dict):
             continue
@@ -397,8 +501,6 @@ def _fund_rows(data: dict[str, Any], profile, fields: dict[str, Any]) -> None:
         asset = str(fund.get("asset_class") or "").strip()
         amount = str(fund.get("amount") or "").strip()
         if not amount and idx == 1 and len(funds) == 1 and profile.category in {"ilp", "unit_trust"}:
-            # For one selected fund, the transaction premium/investment amount is a safe fallback.
-            # With multiple funds, do not put the whole premium into fund 1 when the split is unknown.
             amount = str(data.get("premium") or "").strip()
         if profile.category == "unit_trust":
             fields[f"UT {idx}"] = "IFAST (UT)" if profile.key == "ifast_unit_trust" else "UT"
@@ -411,7 +513,6 @@ def _fund_rows(data: dict[str, Any], profile, fields: dict[str, Any]) -> None:
         asset_field = "Asset Class" if idx == 1 else f"Asset Class_{idx}"
         if asset:
             fields[asset_field] = asset
-
 
 def _premium_display(data: dict[str, Any], profile) -> str:
     premium = str(data.get("premium") or "").strip()
@@ -427,13 +528,23 @@ def _premium_display(data: dict[str, Any], profile) -> str:
     return amount
 
 
-def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, Any], dict[str, str]]:
+def tfp_field_map(
+    data: dict[str, Any],
+    product_type: str,
+    signature_plan: dict[str, list[dict[str, str]]] | None = None,
+    client_signature_uploaded: bool = False,
+    fa_signature_uploaded: bool = False,
+) -> tuple[dict[str, Any], dict[str, str]]:
     """Map enriched case data to TFP fields without inventing compliance facts."""
     profile = classify_product(data, product_type)
     name = str(data.get("client_name") or "")
     nric = str(data.get("nric") or "")
     fa = str(data.get("adviser_name") or "")
     plan = str(data.get("plan_name") or profile.label)
+    # When product classification itself establishes a specific variant, keep the
+    # displayed product name aligned with that supported variant.
+    if profile.key == "ilp_10_flex_3" and "investready" in plan.lower().replace(" ", "") and "flex" not in plan.lower():
+        plan = f"{plan} 10 Flexi 3"
     insurer = str(data.get("insurer_name") or profile.company or product_type)
     page13 = data.get("page13") if isinstance(data.get("page13"), dict) else {}
     today = today_ddmmyyyy()
@@ -536,32 +647,52 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         "Text41": page13.get("other_limitations", ""),
         BOR_FIELD: data.get("recommendation_text", ""),
         BOR_FIELD_ALT: data.get("recommendation_text", ""),
-        "date": today,
-        # Dates beside signatures/acknowledgements generated by this workflow.
-        "Date21_af_client_1": today,
-        "Date21_af_client_5": today,
-        "Date21_af_client_6": today,
-        "Date23_af_client_1": today,
-        "Date23_af_client": today,
+        # Page 18 next periodic review - annual by default, editable by adviser.
+        "date": data.get("next_review_date") or next_review_ddmmyyyy(),
     }
 
-    # Only date CKA / disclosure checklist when those sections are actually applicable.
-    if isinstance(data.get("cka_met"), bool) and profile.requires_cka:
-        fields["Date21_af_client_2"] = today
-    if profile.disclosure_checklist == "life":
-        fields["Date21_af_client_3"] = today
-    elif profile.disclosure_checklist == "unit_trust":
-        fields["Date21_af_client_4"] = today
+    # Dates are populated only where an uploaded signature is actually eligible
+    # to be stamped on that page.
+    sig_plan = signature_plan or tfp_signature_plan(data)
+    if client_signature_uploaded:
+        client_pages = {item.get("page") for item in sig_plan.get("client_apply", [])}
+        if "Page 8" in client_pages:
+            fields["Date21_af_client_1"] = today
+        if "Page 12" in client_pages:
+            fields["Date21_af_client_2"] = today
+        if "Page 15" in client_pages:
+            fields["Date21_af_client_3"] = today
+        if "Page 16" in client_pages:
+            fields["Date21_af_client_4"] = today
+        if "Page 17" in client_pages:
+            fields["Date21_af_client_5"] = today
+        if "Page 18" in client_pages:
+            fields["Date21_af_client_6"] = today
+    if fa_signature_uploaded:
+        fa_pages = {item.get("page") for item in sig_plan.get("fa_apply", [])}
+        if "Page 18" in fa_pages:
+            fields["Date23_af_client_1"] = today
+        if "Page 20" in fa_pages:
+            fields["Date23_af_client"] = today
 
     _fund_rows(data, profile, fields)
 
     cb: dict[str, str] = {}
 
-    # FA declaration category - one applicable category, not every category.
-    if profile.category == "unit_trust":
-        cb["Collective Investment"] = "Collective Investment"
-    elif profile.category in {"ilp", "life", "participating_life"}:
+    # Page 3 adviser authorisation - never infer from the product selected.
+    auth = set(data.get("fa_authorization_categories") or [])
+    if "health" in auth:
+        cb["Health Insurance"] = "Health Insurance"
+    if "life_ilp" in auth:
         cb["Life Insurance  InvestmentLinked ILP"] = "Life Insurance  InvestmentLinked ILP"
+    if "collective_investment" in auth:
+        cb["Collective Investment"] = "Collective Investment"
+    if "group" in auth:
+        cb["Group Insurance"] = "Group Insurance"
+    if "general" in auth:
+        cb["General Insurance"] = "General Insurance"
+    if "other" in auth:
+        cb["Others please specify"] = "Others please specify"
 
     # Personal particulars: only facts actually known.
     gender = str(data.get("gender") or "").lower()
@@ -589,6 +720,20 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
     english = data.get("english")
     if str(english or "").lower() in {"yes", "y", "true", "proficient"}:
         cb["yes1"] = "yes1"
+
+    # Pages 6-7 explicit client choices.
+    if isinstance(data.get("dependants_included"), bool):
+        cb["Check Box32" if data["dependants_included"] else "Check Box33"] = "Yes"
+    insurance_choice = str(data.get("insurance_portfolio_choice") or "")
+    insurance_map = {"provide_details": "yes p", "promiseland_only": "yes refer", "none_or_not_disclosed": "No Existing Insurance Policy with"}
+    if insurance_choice in insurance_map:
+        cb[insurance_map[insurance_choice]] = insurance_map[insurance_choice]
+    investment_choice = str(data.get("investment_portfolio_choice") or "")
+    investment_map = {"provide_details": "No Existing ILPCIS PolicyPortfolio2", "promiseland_only": "No Existing ILPCIS PolicyPortfolio3", "none_or_not_disclosed": "No Existing ILPCIS PolicyPortfolio1"}
+    if investment_choice in investment_map:
+        cb[investment_map[investment_choice]] = investment_map[investment_choice]
+    if isinstance(data.get("health_condition"), bool):
+        cb["y4" if data["health_condition"] else "n4"] = "On"
 
     _priority_checkboxes(data, cb)
     _financial_disclosure_checkboxes(data, cb)
@@ -620,7 +765,6 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
         _bool_cb(cb, "Yes6", "No6", data.get("cka_work_experience") if isinstance(data.get("cka_work_experience"), bool) else None)
         _bool_cb(cb, "Yes7", "No7", data.get("cka_met") if isinstance(data.get("cka_met"), bool) else None)
         # Page 12 choice (advice/suitability/proceed) intentionally remains blank unless explicitly supplied.
-        ack = str(data.get("cka_acknowledgement") or "").lower()
         ack_map = {
             "pass_no_advice": "Yes8",
             "pass_advice": "No8",
@@ -630,14 +774,49 @@ def tfp_field_map(data: dict[str, Any], product_type: str) -> tuple[dict[str, An
             "fail_suitable": "Yes10",
             "fail_not_suitable": "No10",
         }
-        if ack in ack_map:
-            cb[ack_map[ack]] = ack_map[ack]
+        acks = data.get("cka_acknowledgements") or []
+        if not isinstance(acks, (list, tuple, set)):
+            acks = [acks]
+        legacy_ack = str(data.get("cka_acknowledgement") or "").lower()
+        if legacy_ack:
+            acks = list(acks) + [legacy_ack]
+        for ack in acks:
+            key = str(ack or "").lower()
+            if key in ack_map:
+                cb[ack_map[key]] = ack_map[key]
 
-    # Applicable disclosure checklist only; never tick both.
-    if profile.disclosure_checklist == "life":
-        cb["Check Box42"] = "Check Box42"
-    elif profile.disclosure_checklist == "unit_trust":
-        cb["Check Box43"] = "Check Box43"
+    # Page 13 Business Trail - explicit case facts only.
+    business_maps = {
+        "client_source": {"existing_client": "Existing Client", "referred": "Referred by", "lead": "Lead from", "other": "Others"},
+        "prospecting_method": {"firm_premises": "At Firms premises", "client_premises": "Clients premises", "roadshow": "Roadshow", "retailer": "Retailer", "street_canvassing": "Street canvassing", "seminar": "Seminar", "phone": "Over the phone", "video": "Video conferencing", "internet_social": "InternetSocialmedia", "referral": "Referral", "unable_recall": "Unable to recall", "other": "Others_2"},
+        "advisory_location": {"firm_premises": "At Firms premises_2", "client_premises": "Clients premises_2", "roadshow": "Roadshow_2", "retailer": "Retailer_2", "seminar": "Seminar_2", "phone": "Over the phone_2", "video": "Video conferencing_2", "unable_recall": "Unable to recall_2", "other": "Others_3"},
+        "advisory_approach": {"face_to_face": "Face to Face", "non_face_to_face": "Non Face to Face"},
+    }
+    for key, mapping in business_maps.items():
+        value = str(data.get(key) or "")
+        if value in mapping:
+            cb[mapping[value]] = mapping[value]
+    if data.get("prospecting_date"):
+        fields["Date166_af_date"] = data.get("prospecting_date")
+    if data.get("advisory_date"):
+        fields["Date167_af_date"] = data.get("advisory_date")
+
+    # Disclosure checklist acknowledgement is not automatically ticked merely
+    # because that page applies to the product.
+    if data.get("disclosure_confirmed") is True:
+        if profile.disclosure_checklist == "life":
+            cb["Check Box42"] = "Check Box42"
+        elif profile.disclosure_checklist == "unit_trust":
+            cb["Check Box43"] = "Check Box43"
+
+    # Page 17 explicit declaration answers.
+    _bool_cb(cb, "Check Box47", "Check Box48", data.get("replacement_intent") if isinstance(data.get("replacement_intent"), bool) else None)
+    _bool_cb(cb, "Check Box63", "Check Box64", data.get("payer_is_client") if isinstance(data.get("payer_is_client"), bool) else None)
+    _bool_cb(cb, "Check Box67", "Check Box68", data.get("sole_interest") if isinstance(data.get("sole_interest"), bool) else None)
+    _bool_cb(cb, "Check Box71", "Check Box72", data.get("pep_self") if isinstance(data.get("pep_self"), bool) else None)
+    _bool_cb(cb, "Check Box75", "Check Box76", data.get("pep_family") if isinstance(data.get("pep_family"), bool) else None)
+    _bool_cb(cb, "Check Box79", "Check Box80", data.get("pep_associate") if isinstance(data.get("pep_associate"), bool) else None)
+    _bool_cb(cb, "Check Box7_1", "Check Box8", data.get("affordability_comfortable") if isinstance(data.get("affordability_comfortable"), bool) else None)
 
     # Source of funds declaration: use transaction funding source only.
     # Multiple actual sources may be selected (e.g. Employment + Savings + CPF).

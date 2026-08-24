@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .extractor import build_case
-from .pdf_fill import fill_pdf, stamp_signatures, tfp_field_map
+from .pdf_fill import fill_pdf, stamp_signatures, tfp_field_map, tfp_signature_plan
 from .insurer_fill import generate_insurer_forms
 from .settings import PROJECT_ROOT, TEMPLATE_DIR, UPLOADS_DIR, OUTPUTS_DIR
 
@@ -40,12 +40,16 @@ async def save_upload(upload: UploadFile | None, dest: Path) -> Path | None:
     return path
 
 
-def _augment_needs_attention_with_runtime(data: dict, client_sig_path: Path | None, fa_sig_path: Path | None) -> dict:
-    """Add upload/runtime checks that the document extractor cannot know.
+def _augment_needs_attention_with_runtime(
+    data: dict,
+    client_sig_path: Path | None,
+    fa_sig_path: Path | None,
+    signature_plan: dict | None = None,
+) -> dict:
+    """Add runtime signature checks that report actual page eligibility.
 
-    Missing signatures are shown on the result page rather than being invented or
-    silently stamped. The generated PDF remains editable so the adviser can complete
-    these items manually before submission.
+    An uploaded image is not described as "applied" to pages whose declarations
+    are incomplete. Those pages are explicitly reported as held back.
     """
     review = data.get("needs_attention") if isinstance(data.get("needs_attention"), dict) else {}
     groups = {
@@ -55,37 +59,48 @@ def _augment_needs_attention_with_runtime(data: dict, client_sig_path: Path | No
     }
 
     def add(group: str, code: str, label: str, detail: str, page: str):
-        # Avoid duplicates when a case is re-rendered.
         if any(item.get("code") == code for items in groups.values() for item in items if isinstance(item, dict)):
             return
         groups[group].append({
-            "code": code,
-            "label": label,
+            "code": code, "label": label,
             "status": "PASS" if group == "checked" else "REVIEW",
-            "detail": detail,
-            "page": page,
-            "level": group,
+            "detail": detail, "page": page, "level": group,
         })
 
+    plan = signature_plan or tfp_signature_plan(data)
+    client_apply = plan.get("client_apply", [])
+    client_hold = plan.get("client_hold", [])
+    fa_apply = plan.get("fa_apply", [])
+    fa_hold = plan.get("fa_hold", [])
+
     if client_sig_path and client_sig_path.exists():
-        add("checked", "client_signature_upload", "Client signature", "Client signature image was uploaded and applied to applicable client signature fields. Double-check placement before submission.", "Pages 8, 12, 15/16, 17 & 18")
+        if client_apply:
+            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply if item.get("page")))
+            add("checked", "client_signature_applied", "Client signature", f"Client signature image will be applied only to currently eligible TFP pages: {pages}.", pages)
+        if client_hold:
+            detail = "; ".join(f"{item.get('page')}: {item.get('reason')}" for item in client_hold)
+            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_hold if item.get("page")))
+            add("action_required", "client_signature_held", "Client signature held back", "The uploaded client signature is not stamped onto incomplete declarations. " + detail + ".", pages)
     else:
-        add("action_required", "client_signature_upload", "Client signature missing", "No client signature image was uploaded. Sign every applicable client acknowledgement/declaration in the editable TFP before submission.", "Pages 8, 12, 15/16, 17 & 18")
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in client_apply + client_hold if item.get("page")))
+        add("action_required", "client_signature_upload", "Client signature missing", "No client signature image was uploaded. Sign the applicable client declarations after the underlying information is complete.", pages or "Applicable TFP pages")
 
     if fa_sig_path and fa_sig_path.exists():
-        add("checked", "fa_signature_upload", "FA signature", "FA signature image was uploaded and applied to applicable FA signature fields. Double-check placement before submission.", "Pages 18 & 20")
+        if fa_apply:
+            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply if item.get("page")))
+            add("checked", "fa_signature_applied", "FA signature", f"FA signature image will be applied only to currently eligible TFP pages: {pages}.", pages)
+        if fa_hold:
+            detail = "; ".join(f"{item.get('page')}: {item.get('reason')}" for item in fa_hold)
+            pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_hold if item.get("page")))
+            add("action_required", "fa_signature_held", "FA signature held back", "The uploaded FA signature is not stamped onto incomplete declarations. " + detail + ".", pages)
     else:
-        add("action_required", "fa_signature_upload", "FA signature missing", "No FA signature image was uploaded. Complete the applicable FA Representative signatures in the editable TFP before submission.", "Pages 18 & 20")
+        pages = ", ".join(dict.fromkeys(item.get("page", "") for item in fa_apply + fa_hold if item.get("page")))
+        add("action_required", "fa_signature_upload", "FA signature missing", "No FA signature image was uploaded. Complete the applicable FA Representative signatures after the declarations are ready.", pages or "Pages 18 & 20")
 
-    # A joint case can never reuse the first client's signature for the joint client.
     if data.get("is_joint_case"):
-        add("action_required", "joint_signature", "Joint-client signature", "Joint case detected. The first client's signature is not copied into the joint-client signature boxes; obtain the joint client's own signature where applicable.", "Pages 8, 15/16, 17 & 18")
+        add("action_required", "joint_signature", "Joint-client signature", "Joint case detected. The first client's signature is not copied into joint-client signature boxes; obtain the joint client's own signature where applicable.", "Pages 8, 15/16, 17 & 18")
 
-    groups["counts"] = {
-        "action_required": len(groups["action_required"]),
-        "please_review": len(groups["please_review"]),
-        "checked": len(groups["checked"]),
-    }
+    groups["counts"] = {k: len(groups[k]) for k in ("action_required", "please_review", "checked")}
     data["needs_attention"] = groups
     return groups
 
@@ -125,15 +140,20 @@ async def generate(
     client_sig_path = await save_upload(client_signature, upload_dir)
 
     data = build_case(docs, adviser_email, product_type, expected_retirement_income)
-    needs_attention = _augment_needs_attention_with_runtime(data, client_sig_path, fa_sig_path)
+    signature_plan = tfp_signature_plan(data)
+    needs_attention = _augment_needs_attention_with_runtime(data, client_sig_path, fa_sig_path, signature_plan)
     client = safe_name(data.get("client_name", "client"))
 
     # 1. TFP
-    tfp_fields, tfp_checks = tfp_field_map(data, product_type)
+    tfp_fields, tfp_checks = tfp_field_map(
+        data, product_type, signature_plan=signature_plan,
+        client_signature_uploaded=bool(client_sig_path and client_sig_path.exists()),
+        fa_signature_uploaded=bool(fa_sig_path and fa_sig_path.exists()),
+    )
     tfp_tmp = job_dir / f"{client}_TFP_fields.pdf"
     tfp_out = job_dir / f"{client}_Completed_TFP.pdf"
     fill_pdf(TEMPLATE_DIR / "blank_tfp.pdf", tfp_tmp, tfp_fields, tfp_checks)
-    stamp_signatures(tfp_tmp, tfp_out, client_sig_path, fa_sig_path, kind="tfp")
+    stamp_signatures(tfp_tmp, tfp_out, client_sig_path, fa_sig_path, kind="tfp", data=data, signature_plan=signature_plan)
     try: tfp_tmp.unlink()
     except Exception: pass
 

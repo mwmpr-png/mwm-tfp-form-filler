@@ -511,6 +511,57 @@ def extract_compliance_facts(
     fields = fields or {}
     facts: dict[str, Any] = {}
 
+    # Page 3 - adviser authorisation is an adviser-specific fact. The product
+    # selected does not prove that the adviser is authorised for that category.
+    fa_auth: list[str] = []
+    for code, field_name in (
+        ("health", "Health Insurance"),
+        ("life_ilp", "Life Insurance  InvestmentLinked ILP"),
+        ("collective_investment", "Collective Investment"),
+        ("group", "Group Insurance"),
+        ("general", "General Insurance"),
+        ("other", "Others please specify"),
+    ):
+        if _checked(fields, field_name):
+            fa_auth.append(code)
+    supplied_auth = data.get("fa_authorization_categories")
+    if isinstance(supplied_auth, (list, tuple, set)):
+        for item in supplied_auth:
+            code = clean(item).lower().replace(" ", "_")
+            if code and code not in fa_auth:
+                fa_auth.append(code)
+    facts["fa_authorization_categories"] = fa_auth
+
+    # Pages 6-7 - explicit portfolio / dependant / health choices. These are
+    # questions to the client, so a blank response is never converted into No.
+    facts["dependants_included"] = (
+        data.get("dependants_included") if isinstance(data.get("dependants_included"), bool)
+        else _explicit_yes_no(fields, "Check Box32", "Check Box33")
+    )
+    insurance_choice = clean(data.get("insurance_portfolio_choice"))
+    if not insurance_choice:
+        if _checked(fields, "yes p"):
+            insurance_choice = "provide_details"
+        elif _checked(fields, "yes refer"):
+            insurance_choice = "promiseland_only"
+        elif _checked(fields, "No Existing Insurance Policy with"):
+            insurance_choice = "none_or_not_disclosed"
+    facts["insurance_portfolio_choice"] = insurance_choice
+
+    investment_choice = clean(data.get("investment_portfolio_choice"))
+    if not investment_choice:
+        if _checked(fields, "No Existing ILPCIS PolicyPortfolio2"):
+            investment_choice = "provide_details"
+        elif _checked(fields, "No Existing ILPCIS PolicyPortfolio3"):
+            investment_choice = "promiseland_only"
+        elif _checked(fields, "No Existing ILPCIS PolicyPortfolio1"):
+            investment_choice = "none_or_not_disclosed"
+    facts["investment_portfolio_choice"] = investment_choice
+    facts["health_condition"] = (
+        data.get("health_condition") if isinstance(data.get("health_condition"), bool)
+        else _explicit_yes_no(fields, "y4", "n4")
+    )
+
     # Page 8 - only use actual disclosed values.  Never invent expenses/liabilities.
     facts["annual_income"] = _money_or_blank(_field(fields, "Text119") or data.get("annual_income"))
     facts["annual_expenses"] = _money_or_blank(_field(fields, "Text25") or data.get("annual_expenses"))
@@ -557,6 +608,14 @@ def extract_compliance_facts(
         disclosure_note
         and any(x in low_note for x in ("partial", "not disclose", "not disclosed", "do not want to factor", "exclude property", "not factor"))
     )
+    facts["cashflow_included"] = (
+        data.get("cashflow_included") if isinstance(data.get("cashflow_included"), bool)
+        else _explicit_yes_no(fields, "HV", "1R")
+    )
+    facts["assets_liabilities_included"] = (
+        data.get("assets_liabilities_included") if isinstance(data.get("assets_liabilities_included"), bool)
+        else _explicit_yes_no(fields, "HV_4", "1R_4")
+    )
 
     # Budget / funding source.  Keep annual and single budget separate.
     facts["annual_budget"] = _money_or_blank(_field(fields, "Text150") or data.get("annual_budget"))
@@ -568,6 +627,16 @@ def extract_compliance_facts(
         or facts["single_budget_source"]
         or clean(data.get("source_of_funds"))
     )
+
+    # Page 9 retirement FNA and savings/investment FNA. Preserve a completed
+    # reference/supporting TFP when these fields are already available.
+    facts["retirement_amt"] = _money_or_blank(_field(fields, "fill_27") or data.get("retirement_amt"))
+    facts["retirement_income"] = _money_or_blank(_field(fields, "fill_29") or data.get("retirement_income"))
+    facts["retirement_shortfall"] = _money_or_blank(_field(fields, "fill_311") or data.get("retirement_shortfall"))
+    facts["retirement_years"] = _field(fields, "Text306") or clean(data.get("retirement_years"))
+    facts["retirement_total_amt"] = _money_or_blank(_field(fields, "fill_33") or data.get("retirement_total_amt"))
+    facts["retirement_other_sources"] = _money_or_blank(_field(fields, "fill_35") or data.get("retirement_other_sources"))
+    facts["retirement_amt_plan"] = _money_or_blank(_field(fields, "fill_37") or data.get("retirement_amt_plan"))
 
     # Page 9 savings/investment FNA (reference case fields).
     facts["investment_goal"] = _money_or_blank(_field(fields, "fill_39") or data.get("investment_goal"))
@@ -631,6 +700,31 @@ def extract_compliance_facts(
         else:
             facts["cka_met"] = None
 
+    # Page 12 CKA acknowledgement path may require more than one tick (for
+    # example: DID NOT PASS + proceed + suitable). Preserve all explicit ticks.
+    cka_acknowledgements: list[str] = []
+    ack_fields = (
+        ("pass_no_advice", "Yes8"),
+        ("pass_advice", "No8"),
+        ("pass_suitable", "Yes9"),
+        ("pass_not_suitable", "No9"),
+        ("fail_proceed", "Check Box5"),
+        ("fail_suitable", "Yes10"),
+        ("fail_not_suitable", "No10"),
+    )
+    for value, field_name in ack_fields:
+        if _checked(fields, field_name):
+            cka_acknowledgements.append(value)
+    supplied_ack = data.get("cka_acknowledgements")
+    if isinstance(supplied_ack, (list, tuple, set)):
+        for item in supplied_ack:
+            value = clean(item)
+            if value and value not in cka_acknowledgements:
+                cka_acknowledgements.append(value)
+    elif clean(data.get("cka_acknowledgement")):
+        cka_acknowledgements.append(clean(data.get("cka_acknowledgement")))
+    facts["cka_acknowledgements"] = cka_acknowledgements
+
     # Selected-client indicators.  Unknown values remain unknown; do not assume.
     facts["english_proficient"] = _english_value(data, fields)
     facts["education_level"] = clean(data.get("education")) or _field(fields, "Highest Education Level")
@@ -664,6 +758,68 @@ def extract_compliance_facts(
     facts["other_product_limitations"] = _field(fields, "Text41") or clean(data.get("other_product_limitations"))
     facts["investment_objective_text"] = _field(fields, "Text37") or clean(data.get("investment_objective_text"))
     facts["investment_time_horizon"] = _extract_time_horizon(fields, data) or _horizon_from_risk_taking(risk_taking)
+
+    # Page 13 business-trail facts. Keep each choice blank unless it is explicitly
+    # present in a supporting form or supplied as structured case data.
+    def checked_choice(pairs: tuple[tuple[str, str], ...], supplied_key: str) -> str:
+        supplied = clean(data.get(supplied_key))
+        if supplied:
+            return supplied
+        for value, field_name in pairs:
+            if _checked(fields, field_name):
+                return value
+        return ""
+
+    facts["client_source"] = checked_choice((
+        ("existing_client", "Existing Client"), ("referred", "Referred by"),
+        ("lead", "Lead from"), ("other", "Others"),
+    ), "client_source")
+    facts["prospecting_method"] = checked_choice((
+        ("firm_premises", "At Firms premises"), ("client_premises", "Clients premises"),
+        ("roadshow", "Roadshow"), ("retailer", "Retailer"),
+        ("street_canvassing", "Street canvassing"), ("seminar", "Seminar"),
+        ("phone", "Over the phone"), ("video", "Video conferencing"),
+        ("internet_social", "InternetSocialmedia"), ("referral", "Referral"),
+        ("unable_recall", "Unable to recall"), ("other", "Others_2"),
+    ), "prospecting_method")
+    facts["advisory_location"] = checked_choice((
+        ("firm_premises", "At Firms premises_2"), ("client_premises", "Clients premises_2"),
+        ("roadshow", "Roadshow_2"), ("retailer", "Retailer_2"),
+        ("seminar", "Seminar_2"), ("phone", "Over the phone_2"),
+        ("video", "Video conferencing_2"), ("unable_recall", "Unable to recall_2"),
+        ("other", "Others_3"),
+    ), "advisory_location")
+    facts["advisory_approach"] = checked_choice((
+        ("face_to_face", "Face to Face"), ("non_face_to_face", "Non Face to Face"),
+    ), "advisory_approach")
+    facts["prospecting_date"] = _field(fields, "Date166_af_date") or clean(data.get("prospecting_date"))
+    facts["advisory_date"] = _field(fields, "Date167_af_date") or clean(data.get("advisory_date"))
+
+    # Page 17 AML/CFT and Page 18 affordability acknowledgements. Only explicit
+    # answers are promoted; blank declarations remain blank and are flagged.
+    facts["replacement_intent"] = (
+        data.get("replacement_intent") if isinstance(data.get("replacement_intent"), bool)
+        else _explicit_yes_no(fields, "Check Box47", "Check Box48")
+    )
+    facts["payer_is_client"] = (
+        data.get("payer_is_client") if isinstance(data.get("payer_is_client"), bool)
+        else _explicit_yes_no(fields, "Check Box63", "Check Box64")
+    )
+    facts["sole_interest"] = (
+        data.get("sole_interest") if isinstance(data.get("sole_interest"), bool)
+        else _explicit_yes_no(fields, "Check Box67", "Check Box68")
+    )
+    facts["pep_self"] = data.get("pep_self") if isinstance(data.get("pep_self"), bool) else _explicit_yes_no(fields, "Check Box71", "Check Box72")
+    facts["pep_family"] = data.get("pep_family") if isinstance(data.get("pep_family"), bool) else _explicit_yes_no(fields, "Check Box75", "Check Box76")
+    facts["pep_associate"] = data.get("pep_associate") if isinstance(data.get("pep_associate"), bool) else _explicit_yes_no(fields, "Check Box79", "Check Box80")
+    facts["affordability_comfortable"] = (
+        data.get("affordability_comfortable") if isinstance(data.get("affordability_comfortable"), bool)
+        else _explicit_yes_no(fields, "Check Box7_1", "Check Box8")
+    )
+    facts["disclosure_confirmed"] = bool(
+        data.get("disclosure_confirmed") is True or _checked(fields, "Check Box42", "Check Box43")
+    )
+    facts["next_review_date"] = _field(fields, "date") or clean(data.get("next_review_date"))
 
     # Client/adviser actions are only treated as facts when explicitly recorded.
     # If this is an already-completed TFP, read the evidence from its BOR field.
@@ -944,25 +1100,69 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
             level = "checked" if status == "PASS" else "please_review"
         checks.append({"code": code, "label": label, "status": status, "detail": detail, "page": page, "level": level})
 
-    if facts.get("annual_income") and facts.get("annual_expenses"):
-        add("cashflow", "Cash flow", "PASS", "Actual income and expenses are available; no default expense has been invented.", "Page 8")
+    # Page 3: do not infer an adviser's authorisation from the product selected.
+    expected_auth = "collective_investment" if profile.category == "unit_trust" else ("life_ilp" if profile.category in {"ilp", "life", "participating_life"} else "")
+    auth = set(facts.get("fa_authorization_categories") or [])
+    if expected_auth and expected_auth in auth:
+        add("fa_authorisation", "FA product authorisation", "PASS", "The applicable adviser product-authorisation category is explicitly recorded.", "Page 3")
+    elif expected_auth:
+        add("fa_authorisation", "FA product authorisation", "REVIEW", "Confirm the FA Representative's applicable product-authorisation category. The selected product alone does not prove adviser authorisation.", "Page 3", "action_required")
+
+    # Pages 6-7: client choices must be explicit rather than defaulting to No.
+    if isinstance(facts.get("dependants_included"), bool):
+        add("dependants", "Dependants for needs analysis", "PASS", "The client's dependant-inclusion choice is explicitly recorded.", "Page 6")
     else:
-        add("cashflow", "Cash flow", "REVIEW", "Income and/or annual expenses are missing from the uploaded information. Complete the actual client figures in the editable TFP.", "Page 8", "action_required")
+        add("dependants", "Dependants for needs analysis", "REVIEW", "Confirm whether dependant(s) should be included in the Needs Analysis.", "Page 6", "action_required")
+    if facts.get("insurance_portfolio_choice"):
+        add("insurance_portfolio", "Existing insurance portfolio", "PASS", "The client's existing-insurance portfolio choice is explicitly recorded.", "Page 6")
+    else:
+        add("insurance_portfolio", "Existing insurance portfolio", "REVIEW", "Confirm whether existing insurance policies should be considered and complete the appropriate Page-6 choice.", "Page 6", "action_required")
+    if facts.get("investment_portfolio_choice"):
+        add("investment_portfolio", "Existing investment portfolio", "PASS", "The client's existing-investment portfolio choice is explicitly recorded.", "Page 7")
+    else:
+        add("investment_portfolio", "Existing investment portfolio", "REVIEW", "Confirm whether existing investments should be considered and complete the appropriate Page-7 choice.", "Page 7", "action_required")
+    if isinstance(facts.get("health_condition"), bool):
+        add("health_declaration", "Health condition declaration", "PASS", "The Page-7 health-condition Yes/No response is explicitly recorded.", "Page 7")
+    else:
+        add("health_declaration", "Health condition declaration", "REVIEW", "Complete the Page-7 health-condition Yes/No declaration; a blank response is not treated as No.", "Page 7", "action_required")
+
+    # Page 8 cash flow and assets/liabilities: distinguish missing data from an
+    # explicitly documented partial/non-disclosure.
+    cash_decision = facts.get("cashflow_included")
+    if cash_decision is True and facts.get("annual_income") and facts.get("annual_expenses"):
+        add("cashflow", "Cash flow", "PASS", "Cash-flow inclusion is confirmed and actual income/expenses are available.", "Page 8")
+    elif cash_decision is False and facts.get("financial_disclosure_note"):
+        add("cashflow", "Cash flow", "REVIEW", "Cash flow is explicitly excluded/partially disclosed with a recorded reason. Review whether sufficient financial data has been collected.", "Page 8", "please_review")
+    else:
+        add("cashflow", "Cash flow", "REVIEW", "Confirm the Page-8 Cash Flow Yes/No choice and provide actual annual income/expenses if included.", "Page 8", "action_required")
+
+    assets_decision = facts.get("assets_liabilities_included")
+    has_assets = bool(facts.get("total_assets") or facts.get("personal_use_assets") or facts.get("investment_assets") or facts.get("cpf_total") or facts.get("other_assets"))
+    has_liability_data = bool(facts.get("total_liabilities") or facts.get("loans") or facts.get("other_liabilities"))
+    if assets_decision is True and has_assets and (has_liability_data or clean(facts.get("financial_disclosure_note"))):
+        add("assets_liabilities", "Assets & liabilities", "PASS", "Assets/liabilities inclusion is confirmed and financial-position data is available.", "Page 8")
+    elif assets_decision is False and facts.get("financial_disclosure_note"):
+        add("assets_liabilities", "Assets & liabilities", "REVIEW", "Assets/liabilities are explicitly excluded/partially disclosed with a recorded reason. Review concentration assessment carefully.", "Page 8", "please_review")
+    else:
+        add("assets_liabilities", "Assets & liabilities", "REVIEW", "Confirm the Page-8 Assets & Liabilities Yes/No choice and provide actual figures if included. Do not assume zero liabilities.", "Page 8", "action_required")
 
     budget = affordability.get("budget_amount") or 0
     source = clean(affordability.get("budget_source"))
     if budget and source:
         substantial = affordability.get("budget_substantial")
         if substantial is False:
-            add("budget", "Budget / concentration", "PASS", f"Budget source recorded as {source}; the documented funding-base ratio is below 50%.", "Page 8")
+            add("budget", "Budget / concentration", "PASS", f"Budget source recorded as {source}; the documented funding-base ratio is below 50%.", "Pages 8 & 19")
         elif substantial is True:
             add("budget", "Budget / concentration", "FAIL", f"Budget source recorded as {source}; the budget exceeds 50% of at least one documented funding base. Review affordability/concentration before submission.", "Pages 8 & 19", "please_review")
         else:
             add("budget", "Budget / concentration", "REVIEW", f"Budget and source ({source}) are available, but the correct surplus/assets funding base cannot be fully verified.", "Pages 8 & 19", "action_required")
     elif budget:
-        add("budget", "Source of funds", "REVIEW", "The proposed premium/budget is available but the transaction source of funds is missing. Do not substitute the client's general source of income.", "Pages 8 & 17", "action_required")
+        add("funding_source", "Source of funds / AML", "REVIEW", "The proposed premium/budget is known but its transaction funding source is not confirmed. Complete the actual source on Pages 8 and 17; do not substitute general source of income.", "Pages 8 & 17", "action_required")
     else:
         add("budget", "Budget amount", "REVIEW", "The transaction budget/premium could not be confirmed.", "Page 8", "action_required")
+
+    if budget and affordability.get("budget_substantial") is None:
+        add("affordability_basis", "Affordability / concentration basis", "REVIEW", "The 50% affordability/concentration checks cannot be completed until the relevant income/surplus/assets figures are confirmed.", "Pages 8, 18 & 19", "action_required")
 
     if affordability.get("rsp_to_income") is not None:
         ratio = affordability["rsp_to_income"]
@@ -971,15 +1171,22 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
         ratio = affordability["lump_sum_to_assets"]
         add("supervisor_concentration", "Lump-sum concentration", "PASS" if ratio < 0.5 else "FAIL", f"Lump sum / total assets = {_percent(ratio)} (target < 50%).", "Page 19", "checked" if ratio < 0.5 else "please_review")
 
-    if profile.key == "ilp_10_flex_3":
-        if facts.get("investment_goal") and facts.get("investment_existing") and facts.get("investment_amount_to_plan"):
-            add("fna", "Savings / investment FNA", "PASS", "Target, Page-8 existing investments and amount-to-plan are reconciled.", "Page 9")
+    if profile.category in {"ilp", "unit_trust"}:
+        if facts.get("investment_goal") and facts.get("investment_duration_years") and facts.get("investment_existing") and facts.get("investment_amount_to_plan"):
+            add("fna", "Savings / investment FNA", "PASS", "Target, duration, existing investments and amount-to-plan are recorded for the investment need.", "Page 9")
+        elif profile.key == "ilp_10_flex_3" and facts.get("investment_goal") and facts.get("investment_duration_years"):
+            add("fna", "Savings / investment FNA", "REVIEW", "The 10-Flex-3 target/duration can be derived from the documented premium, but actual existing investments are still needed before amount-to-plan can be completed.", "Pages 8 & 9", "action_required")
         else:
-            add("fna", "Savings / investment FNA", "REVIEW", "Investment-needs FNA needs the actual existing investment amount before the amount-to-plan can be completed safely.", "Pages 8 & 9", "action_required")
+            add("fna", "Savings / investment FNA", "REVIEW", "Complete the relevant Page-9 savings/investment need (target, duration, existing savings/investments and amount-to-plan). Do not derive a target from premium unless the approved product rule supports it.", "Page 9", "action_required")
+    elif profile.key == "singlife_flexi_income":
+        if facts.get("retirement_amt") or data.get("retirement_amt"):
+            add("fna", "Retirement / savings FNA", "PASS", "Retirement/savings need information is available for the recommendation.", "Page 9")
+        else:
+            add("fna", "Retirement / savings FNA", "REVIEW", "Confirm and complete the relevant Page-9 retirement/savings needs analysis for this recommendation.", "Page 9", "action_required")
 
     if facts.get("risk_profile"):
         add("risk_profile", "Client risk profile", "PASS", f"Assigned profile: {facts['risk_profile']}.", "Pages 10 & 13")
-    elif profile.category in {"ilp", "unit_trust"}:
+    elif profile.category in {"ilp", "unit_trust", "participating_life"}:
         add("risk_profile", "Client risk profile", "REVIEW", "Client risk profile cannot be determined from the uploaded data. Do not assume Balanced/Aggressive or copy a reference case.", "Pages 10 & 13", "action_required")
 
     if profile.category in {"ilp", "unit_trust"}:
@@ -1021,11 +1228,30 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
         else:
             add("expected_return", "Expected rate of return", "REVIEW", "Expected return is not supported by the uploaded information. Do not copy 6-8% or another reference-case figure.", "Page 13", "action_required")
 
+    business_values = [facts.get("client_source"), facts.get("prospecting_method"), facts.get("advisory_location"), facts.get("advisory_approach")]
+    if all(clean(v) for v in business_values):
+        add("business_trail", "Business Trail details", "PASS", "Client source, prospecting method, advisory location and advisory approach are explicitly recorded.", "Page 13")
+    else:
+        add("business_trail", "Business Trail details", "REVIEW", "Complete the client source, prospecting method, advisory-session location and Face-to-Face/Non-Face-to-Face details. These are not inferred from the product.", "Page 13", "action_required")
+
     if profile.requires_cka:
+        cka_acks = set(facts.get("cka_acknowledgements") or [])
         if facts.get("cka_met") is True:
-            add("cka", "CKA", "PASS", "At least one qualifying CKA knowledge/experience criterion is explicitly met.", "Pages 11-12")
+            path_complete = ("pass_no_advice" in cka_acks) or ("pass_advice" in cka_acks and bool({"pass_suitable", "pass_not_suitable"} & cka_acks))
+            if path_complete:
+                level = "please_review" if "pass_not_suitable" in cka_acks else "checked"
+                status = "FAIL" if "pass_not_suitable" in cka_acks else "PASS"
+                add("cka", "CKA", status, "CKA is met and the applicable Page-12 acknowledgement/advice path is explicitly recorded.", "Pages 11-12", level)
+            else:
+                add("cka", "CKA", "REVIEW", "CKA is met, but the Page-12 advice/suitability acknowledgement path is incomplete.", "Pages 11-12", "action_required")
         elif facts.get("cka_met") is False:
-            add("cka", "CKA", "REVIEW", "CKA outcome is NOT MET. Complete the correct advice/suitability/acknowledgement path on Page 12.", "Pages 11-12", "action_required")
+            path_complete = "fail_proceed" in cka_acks and bool({"fail_suitable", "fail_not_suitable"} & cka_acks)
+            if path_complete and "fail_suitable" in cka_acks:
+                add("cka", "CKA", "PASS", "CKA is not met; proceed-with-advice and suitable-product acknowledgements are explicitly recorded.", "Pages 11-12")
+            elif path_complete and "fail_not_suitable" in cka_acks:
+                add("cka", "CKA", "FAIL", "CKA is not met and the client is proceeding with an unsuitable product; Appendix A / Senior Management approval is required.", "Page 12", "action_required")
+            else:
+                add("cka", "CKA", "REVIEW", "CKA outcome is NOT MET. Complete the proceed-with-advice and suitability acknowledgement path on Page 12.", "Pages 11-12", "action_required")
         else:
             add("cka", "CKA", "REVIEW", "CKA cannot be determined from a general job title or education label alone. Confirm the qualifying CKA criteria.", "Pages 11-12", "action_required")
         if facts.get("is_joint_case"):
@@ -1036,24 +1262,36 @@ def preflight_checks(data: dict[str, Any], facts: dict[str, Any], profile: Produ
     elif facts.get("selected_client") is None:
         add("selected_client", "Selected Client", "REVIEW", "Selected Client status cannot be fully determined because English proficiency and/or education level is incomplete.", "Page 4", "action_required")
 
-    # Pages 15-16: exactly one disclosure route should apply to the transaction.
+    # Pages 15-16: identify the applicable checklist, but do not automatically
+    # tick the client's disclosure acknowledgement.
     if profile.disclosure_checklist == "life":
-        add("disclosure_route", "Disclosure checklist", "PASS", "Life / ILP disclosure checklist route selected; Unit Trust checklist is not selected.", "Page 15")
+        add("disclosure_route", "Disclosure checklist route", "PASS", "Life / ILP disclosure checklist applies; Unit Trust checklist does not.", "Page 15")
     elif profile.disclosure_checklist == "unit_trust":
-        add("disclosure_route", "Disclosure checklist", "PASS", "Unit Trust disclosure checklist route selected; Life / ILP checklist is not selected.", "Page 16")
+        add("disclosure_route", "Disclosure checklist route", "PASS", "Unit Trust disclosure checklist applies; Life / ILP checklist does not.", "Page 16")
     else:
-        add("disclosure_route", "Disclosure checklist", "REVIEW", "The applicable disclosure checklist could not be determined from the product classification.", "Pages 15-16", "action_required")
+        add("disclosure_route", "Disclosure checklist route", "REVIEW", "The applicable disclosure checklist could not be determined from the product classification.", "Pages 15-16", "action_required")
+    if profile.disclosure_checklist in {"life", "unit_trust"} and not facts.get("disclosure_confirmed"):
+        page = "Page 15" if profile.disclosure_checklist == "life" else "Page 16"
+        add("disclosure_ack", "Disclosure acknowledgement", "REVIEW", "Confirm that the applicable disclosure documents/information were provided and explained before ticking/signing the checklist acknowledgement.", page, "action_required")
 
-    # Page 17: source of funds is a transaction fact, not a synonym for occupation/source of income.
-    if clean(facts.get("source_of_funds")):
-        add("aml_source", "AML / source of funds", "PASS", f"Transaction source of funds recorded as {clean(facts.get('source_of_funds'))}.", "Page 17")
+    # Page 17: source is handled together with Page 8 above; separately require
+    # the payer, sole-interest and political-exposure declarations.
+    aml_answers = (facts.get("payer_is_client"), facts.get("sole_interest"), facts.get("pep_self"), facts.get("pep_family"), facts.get("pep_associate"))
+    if all(isinstance(v, bool) for v in aml_answers):
+        add("aml_declarations", "AML / CFT declarations", "PASS", "Payer, sole-interest and political-exposure Yes/No declarations are explicitly recorded.", "Page 17")
     else:
-        add("aml_source", "AML / source of funds", "REVIEW", "Transaction source of funds is not confirmed. Complete the actual payer/source information before submission.", "Page 17", "action_required")
+        add("aml_declarations", "AML / CFT declarations", "REVIEW", "Complete the Page-17 payer, sole-interest and political-exposure Yes/No declarations. Blank answers are not treated as No.", "Page 17", "action_required")
 
-    # Page 18-20 remain human acknowledgements/declarations. The runtime layer adds a
-    # stronger Action Required item when a client/FA signature image was not uploaded.
-    add("acknowledgements", "Client / FA acknowledgements", "REVIEW", "Review the Page 18 client authorization, Page 19 suitability items and Page 20 FA declaration before submission; these are not inferred from the product selected.", "Pages 18-20", "please_review")
-    add("signatures", "Signatures", "REVIEW", "Double-check every applicable signature/date, including Page 8, CKA acknowledgement (if applicable), disclosure checklist, Page 17, Page 18 and FA declaration.", "Pages 8, 12, 15/16, 17, 18 & 20", "please_review")
+    if isinstance(facts.get("affordability_comfortable"), bool):
+        level = "checked" if facts.get("affordability_comfortable") is True else "please_review"
+        status = "PASS" if facts.get("affordability_comfortable") is True else "FAIL"
+        add("affordability_ack", "Client affordability acknowledgement", status, "The Page-18 affordability/concentration comfort response is explicitly recorded.", "Page 18", level)
+    else:
+        add("affordability_ack", "Client affordability acknowledgement", "REVIEW", "Complete the Page-18 Yes/No acknowledgement on whether the premium/investment is affordable and comfortable.", "Page 18", "action_required")
+
+    # Page 18-20 remain human acknowledgements/declarations. Runtime signature
+    # checks report exactly which signatures were applied or deliberately held back.
+    add("acknowledgements", "Client / FA acknowledgements", "REVIEW", "Review the Page 18 client authorization, Page 19 supervisor suitability items and Page 20 FA declaration before submission; these are not inferred from the product selected.", "Pages 18-20", "please_review")
     priorities_source = clean(facts.get("priorities_source"))
     if priorities_source in {"existing", "explicit"}:
         add("priorities", "Personal priorities", "PASS", "Page-5 priorities are explicitly supported by the case data; verify before submission.", "Page 5")
@@ -1316,7 +1554,9 @@ def enrich_case(
         "investment_assets", "cpf_total", "other_assets", "total_assets", "loans",
         "other_liabilities", "total_liabilities", "net_assets", "financial_disclosure_note",
         "financial_disclosure_partial", "annual_budget", "annual_budget_source", "single_budget",
-        "single_budget_source", "source_of_funds", "investment_goal", "investment_duration_years",
+        "single_budget_source", "source_of_funds", "retirement_amt", "retirement_income",
+        "retirement_shortfall", "retirement_years", "retirement_total_amt", "retirement_other_sources",
+        "retirement_amt_plan", "investment_goal", "investment_duration_years",
         "investment_existing", "investment_amount_to_plan", "risk_return_preference",
         "risk_taking_preference", "risk_profile", "fund_risk_profile", "asset_class",
         "expected_rate_of_return", "sales_charges", "investment_risk_text",
@@ -1324,7 +1564,12 @@ def enrich_case(
         "is_joint_case", "cka_education", "cka_professional_qualification",
         "cka_investment_experience", "cka_work_experience", "cka_met", "selected_client",
         "future_changes", "future_changes_reason", "factsheet_presented", "lower_risk_preference",
-        "risk_mismatch_acknowledged",
+        "risk_mismatch_acknowledged", "cka_acknowledgements", "fa_authorization_categories", "dependants_included",
+        "insurance_portfolio_choice", "investment_portfolio_choice", "health_condition",
+        "cashflow_included", "assets_liabilities_included", "client_source", "prospecting_method",
+        "advisory_location", "advisory_approach", "prospecting_date", "advisory_date",
+        "replacement_intent", "payer_is_client", "sole_interest", "pep_self", "pep_family",
+        "pep_associate", "affordability_comfortable", "disclosure_confirmed", "next_review_date",
     )
     for key in promoted:
         value = facts.get(key)
