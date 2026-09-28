@@ -51,6 +51,8 @@
     .review-foot { color:var(--muted); font-size:12px; line-height:1.45; margin:16px 0 0; }
     iframe { width:100%; height:720px; border:1px solid var(--border); border-radius:10px; background:white; }
     .preview-title { margin-top:28px; }
+    .checker-link { margin:18px 4px 0; text-align:center; color:var(--muted); font-size:13px; line-height:1.5; }
+    .checker-link a { color:var(--navy); font-weight:700; }
     @media(max-width:760px){
       .hero-inner{flex-direction:column; align-items:flex-start;} .logo{max-width:100%; width:240px;}
       .card{padding:20px;} .counts{grid-template-columns:1fr;} iframe{height:560px;}
@@ -153,6 +155,7 @@
 
     <h2 class="preview-title">Preview Completed TFP</h2>
     {% if outputs %}<iframe src="{{ outputs[0][1] }}"></iframe>{% endif %}
+    <p class="checker-link">Once you have a completed TFP, you may use this Ai TFP Checker: <a href="https://mwm-ai-tfp-checker-production.up.railway.app/" target="_blank" rel="noopener">https://mwm-ai-tfp-checker-production.up.railway.app/</a></p>
   </div></div>
 </body>
 </html>
